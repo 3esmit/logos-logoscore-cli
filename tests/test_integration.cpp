@@ -42,6 +42,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <thread>
 #include <vector>
@@ -210,6 +211,72 @@ public:
     pid_t    pid = -1;
 };
 
+// The integration module tree is usually a symlink join into immutable Nix
+// store paths. A reload regression needs to replace one plugin in isolation,
+// so copy every target into a private, writable tree rather than changing the
+// shared test fixture or following a symlink back into the store.
+bool copyModulesTree(const fs::path& source, const fs::path& destination,
+                     std::error_code& error)
+{
+    const fs::path resolved = fs::canonical(source, error);
+    if (error || !fs::is_directory(resolved, error)) return false;
+
+    fs::create_directories(destination, error);
+    if (error) return false;
+
+    for (fs::directory_iterator it(resolved, error), end; !error && it != end;
+         it.increment(error)) {
+        const fs::path target = fs::canonical(it->path(), error);
+        if (error) return false;
+        const fs::path copied = destination / it->path().filename();
+        if (fs::is_directory(target, error)) {
+            if (error || !copyModulesTree(target, copied, error)) return false;
+        } else if (fs::is_regular_file(target, error)) {
+            if (error) return false;
+            fs::copy_file(target, copied, fs::copy_options::overwrite_existing, error);
+            if (error) return false;
+            fs::permissions(copied, fs::perms::owner_write, fs::perm_options::add, error);
+            if (error) return false;
+        }
+    }
+    return !error;
+}
+
+fs::path testBasicPluginPath(const fs::path& modulesDir)
+{
+    std::error_code error;
+    for (fs::recursive_directory_iterator it(modulesDir, error), end; !error && it != end;
+         it.increment(error)) {
+        if (!it->is_regular_file(error) || error) continue;
+        const std::string name = it->path().filename().string();
+        if (name.rfind("test_basic_module_plugin", 0) == 0)
+            return it->path();
+    }
+    return {};
+}
+
+bool replaceBinaryText(const fs::path& path, const std::string& from,
+                       const std::string& to)
+{
+    if (from.empty() || from.size() != to.size()) return false;
+    std::ifstream input(path, std::ios::binary);
+    if (!input) return false;
+    std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    std::size_t offset = 0;
+    bool replaced = false;
+    while ((offset = bytes.find(from, offset)) != std::string::npos) {
+        bytes.replace(offset, from.size(), to);
+        offset += to.size();
+        replaced = true;
+    }
+    if (!replaced) return false;
+
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output) return false;
+    output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    return output.good();
+}
+
 // ── socket-file helpers (shared by the socket-lifecycle tests) ─────────────
 
 // Unix socket paths are hard-capped by sockaddr_un::sun_path — 104 bytes on
@@ -305,6 +372,34 @@ protected:
     void TearDown() override { d.shutdown(); }
 };
 
+class ModuleMetadataReloadTest : public ::testing::Test {
+protected:
+    LogoscoreDaemon d;
+    fs::path copiedModules;
+
+    void SetUp() override {
+        std::string why;
+        if (!d.envReady(why)) GTEST_SKIP() << why;
+
+        copiedModules = fs::temp_directory_path() /
+            ("logoscore_it_modules_" + std::to_string(getpid()) + "_metadata_reload");
+        std::error_code error;
+        ASSERT_TRUE(copyModulesTree(d.modulesDir, copiedModules, error))
+            << "failed to create isolated module tree: " << error.message();
+        d.modulesDir = copiedModules;
+        d.start("metadata_reload");
+        ASSERT_TRUE(d.waitReady())
+            << "daemon did not become reachable.\n--- daemon log ---\n"
+            << slurp(d.daemonLog);
+    }
+
+    void TearDown() override {
+        d.shutdown();
+        std::error_code error;
+        fs::remove_all(copiedModules, error);
+    }
+};
+
 TEST_F(ErrorPathTest, NoLoadNegativePaths) {
     std::string out;
 
@@ -380,6 +475,49 @@ TEST_F(ErrorPathTest, ReportsModuleVersion) {
     ASSERT_EQ(d.run("module-info test_basic_module", &out), 0) << out;
     EXPECT_NE(out.find("uptime_seconds"), std::string::npos)
         << "loaded module-info must report uptime_seconds.\n" << out;
+}
+
+// Regression for #2: replacing an installed package at the same path must not
+// leave the daemon's metadata cache at the version scanned before reload.
+// The test alters only an isolated copy of the test plugin, and uses a
+// same-length replacement so the plugin remains structurally identical apart
+// from its embedded version metadata.
+TEST_F(ModuleMetadataReloadTest, ReloadRefreshesReplacedPluginMetadata) {
+    constexpr const char* oldVersion = "1.0.0";
+    constexpr const char* newVersion = "2.0.0";
+    const std::string oldVersionJson = std::string{"\"version\":\""} + oldVersion + "\"";
+    const std::string newVersionJson = std::string{"\"version\":\""} + newVersion + "\"";
+    std::string out;
+
+    ASSERT_EQ(d.run("load-module test_basic_module", &out, kNegativeBudgetSecs), 0)
+        << "test_basic_module must load before its package is replaced.\n" << out;
+    EXPECT_NE(out.find(oldVersionJson), std::string::npos) << out;
+
+    const fs::path plugin = testBasicPluginPath(copiedModules);
+    ASSERT_FALSE(plugin.empty()) << "test_basic_module plugin was not copied";
+    ASSERT_TRUE(replaceBinaryText(plugin, oldVersion, newVersion))
+        << "isolated plugin did not contain its expected embedded version";
+
+    ASSERT_EQ(d.run("reload-module test_basic_module", &out, kNegativeBudgetSecs), 0)
+        << "reload must load the replacement plugin.\n" << out;
+    EXPECT_NE(out.find(newVersionJson), std::string::npos)
+        << "reload-module must report the replacement plugin metadata.\n" << out;
+
+    ASSERT_EQ(d.run("list-modules", &out), 0) << out;
+    EXPECT_NE(out.find(newVersionJson), std::string::npos)
+        << "list-modules must report the replacement plugin metadata.\n" << out;
+
+    ASSERT_EQ(d.run("status", &out), 0) << out;
+    EXPECT_NE(out.find(newVersionJson), std::string::npos)
+        << "status must report the replacement plugin metadata.\n" << out;
+
+    ASSERT_EQ(d.run("module-info test_basic_module", &out), 0) << out;
+    EXPECT_NE(out.find(newVersionJson), std::string::npos)
+        << "module-info must report the replacement plugin metadata.\n" << out;
+
+    ASSERT_EQ(d.run("call test_basic_module returnTrue", &out), 0) << out;
+    EXPECT_NE(out.find("true"), std::string::npos)
+        << "the replacement plugin must remain callable after reload.\n" << out;
 }
 
 TEST_F(ErrorPathTest, UnknownMethodOnLoadedModule) {
