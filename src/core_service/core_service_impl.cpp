@@ -174,6 +174,10 @@ StdLogosResult CoreServiceImpl::reloadModule(const std::string& name)
         logos_core_unload_module(name.c_str(), false);
     }
 
+    // A package can be replaced in place while the daemon remains running.
+    // Rescan before loading so status and module-info use its current metadata.
+    logos_core_refresh_modules();
+
     bool ok = logos_core_load_module(name.c_str(), true);
     if (!ok) {
         // Non-destructive on failure: if it was running, try to bring it back
