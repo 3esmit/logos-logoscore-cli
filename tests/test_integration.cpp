@@ -255,26 +255,42 @@ fs::path testBasicPluginPath(const fs::path& modulesDir)
     return {};
 }
 
-bool replaceBinaryText(const fs::path& path, const std::string& from,
-                       const std::string& to)
+bool replaceUniqueBinaryText(const fs::path& path, const std::string& from,
+                             const std::string& to)
 {
     if (from.empty() || from.size() != to.size()) return false;
     std::ifstream input(path, std::ios::binary);
     if (!input) return false;
     std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-    std::size_t offset = 0;
-    bool replaced = false;
-    while ((offset = bytes.find(from, offset)) != std::string::npos) {
-        bytes.replace(offset, from.size(), to);
-        offset += to.size();
-        replaced = true;
-    }
-    if (!replaced) return false;
+    const std::size_t offset = bytes.find(from);
+    if (offset == std::string::npos ||
+        bytes.find(from, offset + from.size()) != std::string::npos) return false;
+    bytes.replace(offset, from.size(), to);
 
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
     if (!output) return false;
     output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
     return output.good();
+}
+
+bool resignModifiedPlugin(const fs::path& plugin)
+{
+#if defined(__APPLE__)
+    const pid_t child = fork();
+    if (child < 0) return false;
+    if (child == 0) {
+        execl("/usr/bin/codesign", "codesign", "--force", "--sign", "-",
+              plugin.c_str(), static_cast<char*>(nullptr));
+        _exit(127);
+    }
+
+    int status = 0;
+    return waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 0;
+#else
+    (void)plugin;
+    return true;
+#endif
 }
 
 // ── socket-file helpers (shared by the socket-lifecycle tests) ─────────────
@@ -384,6 +400,9 @@ protected:
         copiedModules = fs::temp_directory_path() /
             ("logoscore_it_modules_" + std::to_string(getpid()) + "_metadata_reload");
         std::error_code error;
+        fs::remove_all(copiedModules, error);
+        ASSERT_FALSE(error)
+            << "failed to clear stale isolated module tree: " << error.message();
         ASSERT_TRUE(copyModulesTree(d.modulesDir, copiedModules, error))
             << "failed to create isolated module tree: " << error.message();
         d.modulesDir = copiedModules;
@@ -396,7 +415,7 @@ protected:
     void TearDown() override {
         d.shutdown();
         std::error_code error;
-        fs::remove_all(copiedModules, error);
+        if (!copiedModules.empty()) fs::remove_all(copiedModules, error);
     }
 };
 
@@ -487,6 +506,14 @@ TEST_F(ModuleMetadataReloadTest, ReloadRefreshesReplacedPluginMetadata) {
     constexpr const char* newVersion = "2.0.0";
     const std::string oldVersionJson = std::string{"\"version\":\""} + oldVersion + "\"";
     const std::string newVersionJson = std::string{"\"version\":\""} + newVersion + "\"";
+    const std::string oldPluginVersionRecord =
+        std::string{"test_basic_module"} + '\0' + oldVersion + '\0';
+    const std::string newPluginVersionRecord =
+        std::string{"test_basic_module"} + '\0' + newVersion + '\0';
+    const std::string oldPluginMetadataRecord =
+        std::string{"\x67" "version" "\x65"} + oldVersion;
+    const std::string newPluginMetadataRecord =
+        std::string{"\x67" "version" "\x65"} + newVersion;
     std::string out;
 
     ASSERT_EQ(d.run("load-module test_basic_module", &out, kNegativeBudgetSecs), 0)
@@ -495,8 +522,17 @@ TEST_F(ModuleMetadataReloadTest, ReloadRefreshesReplacedPluginMetadata) {
 
     const fs::path plugin = testBasicPluginPath(copiedModules);
     ASSERT_FALSE(plugin.empty()) << "test_basic_module plugin was not copied";
-    ASSERT_TRUE(replaceBinaryText(plugin, oldVersion, newVersion))
-        << "isolated plugin did not contain its expected embedded version";
+    // A real package update changes both the plugin implementation's
+    // name/version pair and its Q_PLUGIN_METADATA CBOR value. Replacing the
+    // two unique complete records avoids changing unrelated version-like data.
+    ASSERT_TRUE(replaceUniqueBinaryText(plugin, oldPluginVersionRecord,
+                                        newPluginVersionRecord))
+        << "isolated plugin did not contain exactly one embedded version record";
+    ASSERT_TRUE(replaceUniqueBinaryText(plugin, oldPluginMetadataRecord,
+                                        newPluginMetadataRecord))
+        << "isolated plugin did not contain exactly one embedded metadata record";
+    ASSERT_TRUE(resignModifiedPlugin(plugin))
+        << "isolated plugin could not be signed after metadata replacement";
 
     ASSERT_EQ(d.run("reload-module test_basic_module", &out, kNegativeBudgetSecs), 0)
         << "reload must load the replacement plugin.\n" << out;
