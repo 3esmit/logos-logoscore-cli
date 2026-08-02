@@ -518,8 +518,8 @@ TEST_F(ModuleMetadataReloadTest, ReloadRefreshesReplacedPluginMetadata) {
 
     const fs::path plugin = testBasicPluginPath(copiedModules);
     ASSERT_FALSE(plugin.empty()) << "test_basic_module plugin was not copied";
-    // Q_PLUGIN_METADATA is the source used for discovery. Its CBOR version
-    // record is unique across supported plugin architectures, unlike an
+    // Q_PLUGIN_METADATA is the source used for discovery. The helper verifies
+    // its CBOR version record is unique before mutation, unlike an
     // implementation name/version string that may be emitted more than once.
     ASSERT_TRUE(replaceUniqueBinaryText(plugin, oldPluginMetadataRecord,
                                         newPluginMetadataRecord))
