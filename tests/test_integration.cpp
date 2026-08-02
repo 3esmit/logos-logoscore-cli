@@ -506,10 +506,6 @@ TEST_F(ModuleMetadataReloadTest, ReloadRefreshesReplacedPluginMetadata) {
     constexpr const char* newVersion = "2.0.0";
     const std::string oldVersionJson = std::string{"\"version\":\""} + oldVersion + "\"";
     const std::string newVersionJson = std::string{"\"version\":\""} + newVersion + "\"";
-    const std::string oldPluginVersionRecord =
-        std::string{"test_basic_module"} + '\0' + oldVersion + '\0';
-    const std::string newPluginVersionRecord =
-        std::string{"test_basic_module"} + '\0' + newVersion + '\0';
     const std::string oldPluginMetadataRecord =
         std::string{"\x67" "version" "\x65"} + oldVersion;
     const std::string newPluginMetadataRecord =
@@ -522,12 +518,9 @@ TEST_F(ModuleMetadataReloadTest, ReloadRefreshesReplacedPluginMetadata) {
 
     const fs::path plugin = testBasicPluginPath(copiedModules);
     ASSERT_FALSE(plugin.empty()) << "test_basic_module plugin was not copied";
-    // A real package update changes both the plugin implementation's
-    // name/version pair and its Q_PLUGIN_METADATA CBOR value. Replacing the
-    // two unique complete records avoids changing unrelated version-like data.
-    ASSERT_TRUE(replaceUniqueBinaryText(plugin, oldPluginVersionRecord,
-                                        newPluginVersionRecord))
-        << "isolated plugin did not contain exactly one embedded version record";
+    // Q_PLUGIN_METADATA is the source used for discovery. Its CBOR version
+    // record is unique across supported plugin architectures, unlike an
+    // implementation name/version string that may be emitted more than once.
     ASSERT_TRUE(replaceUniqueBinaryText(plugin, oldPluginMetadataRecord,
                                         newPluginMetadataRecord))
         << "isolated plugin did not contain exactly one embedded metadata record";
