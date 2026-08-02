@@ -476,20 +476,22 @@ TEST_F(ErrorPathTest, StoppedDaemonQueriesReportRpcFailure)
 
     struct QueryResult {
         std::string command;
+        std::string expectedMessage;
         int exitCode = -1;
         std::string output;
     };
     std::array<QueryResult, 3> queries{{
-        {"status"},
-        {"list-modules"},
-        {"stats"},
+        {"status", "getStatus RPC call failed."},
+        {"list-modules", "listModules RPC call failed."},
+        {"stats", "getModuleStats RPC call failed."},
     }};
     LogoscoreDaemon& daemon = d;
     std::vector<std::thread> workers;
     workers.reserve(queries.size());
     for (auto& query : queries) {
-        workers.emplace_back([&daemon, &query]() {
-            query.exitCode = daemon.run(query.command, &query.output, 30);
+        auto* const result = &query;
+        workers.emplace_back([&daemon, result]() {
+            result->exitCode = daemon.run(result->command, &result->output, 30);
         });
     }
     for (auto& worker : workers) worker.join();
@@ -503,6 +505,8 @@ TEST_F(ErrorPathTest, StoppedDaemonQueriesReportRpcFailure)
             << query.command << " must emit an error envelope.\n" << query.output;
         EXPECT_EQ(response.value("code", std::string{}), "RPC_FAILED")
             << query.command << " must preserve the RPC error code.\n" << query.output;
+        EXPECT_EQ(response.value("message", std::string{}), query.expectedMessage)
+            << query.command << " must preserve its RPC failure message.\n" << query.output;
     }
 }
 

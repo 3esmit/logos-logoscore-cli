@@ -393,6 +393,23 @@ TEST_F(CommandTest, ListModules_RpcFailure_ReturnsExit1)
     EXPECT_EQ(doc.value("code", std::string{}), "RPC_FAILED");
 }
 
+TEST_F(CommandTest, ListModules_NonObjectRpcFailure_UsesFallbackError)
+{
+    mockClient.listModulesResult = nullptr;
+
+    auto cmd = createCommand("list-modules", mockClient, output);
+    int exitCode = 0;
+    std::string out = captureOutput([&]() {
+        EXPECT_NO_THROW(exitCode = cmd->execute({}));
+    });
+
+    EXPECT_EQ(exitCode, 1);
+    nlohmann::json doc = parseJson(out);
+    EXPECT_EQ(doc.value("status", std::string{}), "error");
+    EXPECT_EQ(doc.value("code", std::string{}), "RPC_FAILED");
+    EXPECT_EQ(doc.value("message", std::string{}), "listModules RPC call failed.");
+}
+
 // ── status ──────────────────────────────────────────────────────────────────
 
 TEST_F(StatusCommandTest, Status_ValidResponse_Succeeds)
@@ -873,6 +890,23 @@ TEST_F(CommandTest, Stats_RpcFailure_ReturnsExit1)
     nlohmann::json doc = parseJson(out);
     EXPECT_EQ(doc.value("status", std::string{}), "error");
     EXPECT_EQ(doc.value("code", std::string{}), "RPC_FAILED");
+}
+
+TEST_F(CommandTest, Stats_NonObjectRpcFailure_UsesFallbackError)
+{
+    mockClient.moduleStatsResult = nullptr;
+
+    auto cmd = createCommand("stats", mockClient, output);
+    int exitCode = 0;
+    std::string out = captureOutput([&]() {
+        EXPECT_NO_THROW(exitCode = cmd->execute({}));
+    });
+
+    EXPECT_EQ(exitCode, 1);
+    nlohmann::json doc = parseJson(out);
+    EXPECT_EQ(doc.value("status", std::string{}), "error");
+    EXPECT_EQ(doc.value("code", std::string{}), "RPC_FAILED");
+    EXPECT_EQ(doc.value("message", std::string{}), "getModuleStats RPC call failed.");
 }
 
 // ── watch ────────────────────────────────────────────────────────────────────

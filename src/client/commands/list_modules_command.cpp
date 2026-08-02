@@ -22,7 +22,7 @@ int ListModulesCommand::execute(const std::vector<std::string>& args)
     std::string filter = loadedOnly ? "loaded" : "all";
     LogosList modules = client().listModules(filter);
     if (!modules.is_array()) {
-        const LogosMap error = modules.is_object() ? LogosMap(modules) : LogosMap{};
+        const LogosMap error = modules.is_object() ? LogosMap(modules) : LogosMap::object();
         output().printError(error.value("code", std::string{"RPC_FAILED"}),
                             error.value("message", std::string{"listModules RPC call failed."}),
                             error);
