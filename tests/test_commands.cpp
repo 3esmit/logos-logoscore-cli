@@ -433,7 +433,8 @@ TEST_F(StatusCommandTest, Status_RpcFailure_ReturnsExit1)
 {
     mockClient.statusResult = LogosMap{
         {"status", "error"}, {"code", "RPC_FAILED"},
-        {"message", "getStatus RPC call failed."}
+        {"message", "getStatus RPC call failed."},
+        {"details", "transport closed"}
     };
 
     auto cmd = createCommand("status", mockClient, output);
@@ -444,6 +445,7 @@ TEST_F(StatusCommandTest, Status_RpcFailure_ReturnsExit1)
     nlohmann::json doc = parseJson(out);
     EXPECT_EQ(doc.value("status", std::string{}), "error");
     EXPECT_EQ(doc.value("code", std::string{}), "RPC_FAILED");
+    EXPECT_EQ(doc.value("details", std::string{}), "transport closed");
 }
 
 TEST_F(StatusCommandTest, Status_MalformedRpcResponse_UsesFailureEnvelope)

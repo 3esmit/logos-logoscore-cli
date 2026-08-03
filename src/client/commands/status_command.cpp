@@ -49,8 +49,10 @@ int StatusCommand::execute(const std::vector<std::string>& args)
     }
 
     if (status.value("status", std::string{}) == "error") {
-        output().printError(status.value("code", std::string{}),
-                            status.value("message", std::string{}));
+        output().printError(
+            status.value("code", std::string{"RPC_FAILED"}),
+            status.value("message", std::string{"getStatus RPC call failed."}),
+            status);
         return 1;
     }
 
