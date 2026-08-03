@@ -433,7 +433,8 @@ TEST_F(StatusCommandTest, Status_RpcFailure_ReturnsExit1)
 {
     mockClient.statusResult = LogosMap{
         {"status", "error"}, {"code", "RPC_FAILED"},
-        {"message", "getStatus RPC call failed."}
+        {"message", "getStatus RPC call failed."},
+        {"details", "transport closed"}
     };
 
     auto cmd = createCommand("status", mockClient, output);
@@ -444,6 +445,41 @@ TEST_F(StatusCommandTest, Status_RpcFailure_ReturnsExit1)
     nlohmann::json doc = parseJson(out);
     EXPECT_EQ(doc.value("status", std::string{}), "error");
     EXPECT_EQ(doc.value("code", std::string{}), "RPC_FAILED");
+    EXPECT_EQ(doc.value("details", std::string{}), "transport closed");
+}
+
+TEST_F(StatusCommandTest, Status_MalformedRpcResponse_UsesFailureEnvelope)
+{
+    mockClient.statusResult = nullptr;
+
+    auto cmd = createCommand("status", mockClient, output);
+    int exitCode = 0;
+    std::string out = captureOutput([&]() {
+        EXPECT_NO_THROW(exitCode = cmd->execute({}));
+    });
+
+    EXPECT_EQ(exitCode, 1);
+    nlohmann::json doc = parseJson(out);
+    EXPECT_EQ(doc.value("status", std::string{}), "error");
+    EXPECT_EQ(doc.value("code", std::string{}), "RPC_FAILED");
+    EXPECT_EQ(doc.value("message", std::string{}), "getStatus RPC call failed.");
+}
+
+TEST_F(StatusCommandTest, Status_ConnectionFailure_EmitsOneJsonDocument)
+{
+    mockClient.shouldConnect = false;
+
+    auto cmd = createCommand("status", mockClient, output);
+    std::string out = captureOutput([&]() {
+        EXPECT_EQ(cmd->execute({}), 1);
+    });
+
+    EXPECT_EQ(std::count(out.begin(), out.end(), '\n'), 1);
+    nlohmann::json doc = parseJson(out);
+    ASSERT_TRUE(doc.contains("daemon"));
+    ASSERT_TRUE(doc["daemon"].is_object());
+    EXPECT_EQ(doc["daemon"].value("status", std::string{}), "not_running");
+    EXPECT_EQ(doc["daemon"].value("reason", std::string{}), mockClient.connectError);
 }
 
 // ── module-info / info ───────────────────────────────────────────────────────
