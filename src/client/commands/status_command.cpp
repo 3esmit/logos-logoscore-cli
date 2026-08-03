@@ -29,8 +29,10 @@ int StatusCommand::execute(const std::vector<std::string>& args)
         }
     }
 
-    int err = ensureConnected();
-    if (err != 0) {
+    // Status owns its "not running" result, so connect directly instead of
+    // ensureConnected(): the generic helper would emit NO_DAEMON first and
+    // produce a second JSON document before this status result.
+    if (!client().isConnected() && !client().connect()) {
         LogosMap result{{"daemon", LogosMap{
             {"status", "not_running"},
             {"reason", client().lastError()},
@@ -41,6 +43,11 @@ int StatusCommand::execute(const std::vector<std::string>& args)
 
     LogosMap status = client().getStatus();
 
+    if (!status.is_object()) {
+        output().printError("RPC_FAILED", "getStatus RPC call failed.");
+        return 1;
+    }
+
     if (status.value("status", std::string{}) == "error") {
         output().printError(status.value("code", std::string{}),
                             status.value("message", std::string{}));
@@ -48,8 +55,7 @@ int StatusCommand::execute(const std::vector<std::string>& args)
     }
 
     if (!status.contains("daemon")) {
-        LogosMap result{{"daemon", LogosMap{{"status","not_running"}}}};
-        output().printStatus(result);
+        output().printError("RPC_FAILED", "getStatus RPC call failed.");
         return 1;
     }
 
