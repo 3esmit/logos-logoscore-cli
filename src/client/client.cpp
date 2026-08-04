@@ -1,10 +1,12 @@
 #include "client.h"
 #include "../config.h"
+#include "../module_call_timeout.h"
 #include "client_state.h"
 
 #include <logos_api.h>
 #include <logos_api_client.h>
 #include <logos_instance.h>
+#include <logos_mode.h>
 #include <logos_transport_config.h>
 #include <token_manager.h>
 
@@ -26,8 +28,9 @@ struct RpcClient::Impl {
 
     // Helper: invoke a core_service method via the nlohmann::json overload.
     nlohmann::json invoke(const std::string& method,
-                          const nlohmann::json& args = nlohmann::json::array()) {
-        return coreService->invokeRemoteMethod("core_service", method, args);
+                          const nlohmann::json& args = nlohmann::json::array(),
+                          Timeout timeout = Timeout()) {
+        return coreService->invokeRemoteMethod("core_service", method, args, timeout);
     }
 };
 
@@ -204,7 +207,8 @@ LogosMap RpcClient::callModuleMethod(const std::string& module,
                                       const LogosList& args)
 {
     nlohmann::json ret = d->invoke("callModuleMethod",
-                                   nlohmann::json::array({module, method, args}));
+                                   nlohmann::json::array({module, method, args}),
+                                   Timeout(logoscore::kModuleCallTimeoutMs));
     if (ret.is_object()) return ret;
     return LogosMap{{"status","error"},{"code","RPC_FAILED"},
                     {"message", fmt::format("callModuleMethod('{}','{}') RPC call failed.",
