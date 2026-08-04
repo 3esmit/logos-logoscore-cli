@@ -51,9 +51,9 @@ bool RpcClient::connect()
     if (!d->clientState.fileOk) {
         m_lastError = "No client config at " +
             ClientStateFile::filePath() +
-            ". Either run the daemon locally first (it auto-emits a "
-            "config), pass client flags + --persist-config, or write "
-            "client/config.json + the matching token file by hand.";
+            ". Start a daemon in this session (it writes one on boot), or "
+            "install a dial spec with `logosctl client config set FILE` "
+            "alongside the matching token file.";
         return false;
     }
 
@@ -64,7 +64,7 @@ bool RpcClient::connect()
 
     if (d->token.empty()) {
         m_lastError = fmt::format(
-            "No authentication token. Expected at {} or in $LOGOSCORE_TOKEN.",
+            "No authentication token. Expected at {} or in $LOGOSCTL_TOKEN.",
             Config::clientTokenPath(d->clientState.tokenFile));
         return false;
     }
@@ -100,7 +100,7 @@ bool RpcClient::connect()
     // core_service is mandatory.
     auto coreIt = d->clientState.daemon.find("core_service");
     if (coreIt == d->clientState.daemon.end()) {
-        m_lastError = "client/config.json: 'daemon.core_service' is required.";
+        m_lastError = ClientStateFile::filePath() + ": 'daemon.core_service' is required.";
         return false;
     }
     const LogosTransportConfig coreServiceCfg = toCfg(coreIt->second);
@@ -145,12 +145,58 @@ LogosMap RpcClient::loadModule(const std::string& name)
                     {"message", fmt::format("loadModule('{}') RPC call failed.", name)}};
 }
 
-LogosMap RpcClient::unloadModule(const std::string& name)
+LogosMap RpcClient::unloadModule(const std::string& name, bool withDependents)
 {
-    nlohmann::json ret = d->invoke("unloadModule", nlohmann::json::array({name}));
+    nlohmann::json ret = d->invoke("unloadModule",
+                                   nlohmann::json::array({name, withDependents}));
     if (ret.is_object()) return ret;
     return LogosMap{{"status","error"},{"code","RPC_FAILED"},
                     {"message", fmt::format("unloadModule('{}') RPC call failed.", name)}};
+}
+
+LogosMap RpcClient::refreshModules()
+{
+    nlohmann::json ret = d->invoke("refreshModules", nlohmann::json::array());
+    if (ret.is_object()) return ret;
+    return LogosMap{{"status","error"},{"code","RPC_FAILED"},
+                    {"message", "refreshModules() RPC call failed."}};
+}
+
+// ---------------------------------------------------------------------------
+// Package operations — delegate to core_service
+// ---------------------------------------------------------------------------
+
+LogosMap RpcClient::planPackageOperation(const std::string& op, const LogosList& names,
+                                          const LogosMap& opts)
+{
+    nlohmann::json ret = d->invoke("planPackageOperation",
+                                   nlohmann::json::array({op, names, opts}));
+    if (ret.is_object()) return ret;
+    return LogosMap{{"status","error"},{"code","RPC_FAILED"},
+                    {"message", fmt::format("planPackageOperation('{}') RPC call failed.", op)}};
+}
+
+LogosMap RpcClient::applyPackageOperation(const std::string& op, const LogosList& names,
+                                           const LogosMap& opts)
+{
+    // Installs pull from the network and can take minutes on a cold catalog;
+    // the default RPC deadline is far too short for that.
+    nlohmann::json ret = d->invoke("applyPackageOperation",
+                                   nlohmann::json::array({op, names, opts}));
+    if (ret.is_object()) return ret;
+    return LogosMap{{"status","error"},{"code","RPC_FAILED"},
+                    {"message", fmt::format("applyPackageOperation('{}') RPC call failed.", op)}};
+}
+
+LogosMap RpcClient::downloadPackage(const std::string& name, const LogosMap& opts)
+{
+    // Same deadline reasoning as applyPackageOperation: this is a network
+    // fetch, not a local query.
+    nlohmann::json ret = d->invoke("downloadPackage",
+                                   nlohmann::json::array({name, opts}));
+    if (ret.is_object()) return ret;
+    return LogosMap{{"status","error"},{"code","RPC_FAILED"},
+                    {"message", fmt::format("downloadPackage('{}') RPC call failed.", name)}};
 }
 
 LogosMap RpcClient::reloadModule(const std::string& name)

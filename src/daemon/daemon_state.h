@@ -1,6 +1,8 @@
 #ifndef DAEMON_STATE_H
 #define DAEMON_STATE_H
 
+#include <nlohmann/json_fwd.hpp>
+
 #include <map>
 #include <optional>
 #include <string>
@@ -42,9 +44,37 @@ struct TransportInfo {
 // `--persist-config`. Defaults supplied by the merge layer in main.
 // Values reflect intent (e.g. `port: 0` stays `0` — the resolved
 // port lives in DaemonRuntimeState.resolved).
+// Redirects for the session's subdirectories. Empty means "use the default",
+// which is <configDir>/<name> -- that default is what makes a session portable.
+// Set one to share a keyring between sessions, put the cache on a bigger disk,
+// or point at a modules tree something else manages.
+struct SessionDirs {
+    std::string modules;
+    std::string plugins;
+    std::string keyring;
+    std::string data;
+    std::string cache;
+    std::string logs;
+};
+
+// Daemon log file settings. Capture is pipe-based so module subprocesses are
+// included; see src/daemon/log_sink.h.
+struct LoggingConfig {
+    bool        enabled   = true;
+    std::string file      = "daemon.log";
+    // Rotate past this size, keeping maxFiles in total. 0 = never rotate.
+    std::size_t maxSizeMb = 10;
+    std::size_t maxFiles  = 5;
+    // Mirror to the terminal too. Ignored once detached, where the original
+    // stdout is /dev/null.
+    bool console = true;
+};
+
 struct DaemonConfig {
     std::vector<std::string> modulesDirs;
     std::string              persistencePath;
+    SessionDirs              dirs;
+    LoggingConfig            logging;
     // Per-module advertised transport set. Built from
     // `--module-transport` CLI flags (and the previous-launch config
     // when present). `core_service` and `capability_module` always
@@ -52,12 +82,23 @@ struct DaemonConfig {
     // fills in the LocalSocket-only default when neither operator
     // input nor config.json supplied one.
     std::map<std::string, std::vector<TransportInfo>> modules;
-    // Server-side TLS material (paths). Stripped from state.json's
-    // advertised transport set — the daemon needs them to bind, but
-    // clients don't need (and shouldn't see) the key path.
+    // Server-side TLS material (paths), from the top-level `ssl:` block.
+    // These are session-wide DEFAULTS: every `tcp_ssl` listener that does
+    // not name its own `cert:`/`key:`/`ca_file:` inherits them. Applied by
+    // `applySslDefaults` below, which the logosctl front-end calls once
+    // after loading the config; the per-listener fields are what actually
+    // reach the transport set. Stripped from state.json's advertised
+    // transport set — the daemon needs them to bind, but clients don't
+    // need (and shouldn't see) the key path.
     std::string sslCert;
     std::string sslKey;
     std::string sslCa;
+    // Package signature enforcement, pushed into the bundled
+    // package_manager module at boot the same way the keyring directory is.
+    // One of "none" | "warn" | "require"; empty means "say nothing and let
+    // the module keep its own default" (which is warn). Any other value is
+    // rejected by the config reader rather than silently ignored.
+    std::string signaturePolicy;
     // Mirrors --insecure-tcp. Persisted so operators don't have to
     // retype it next launch. False by default.
     bool insecureTcp = false;
@@ -108,6 +149,46 @@ std::string currentUtcIso8601();
 // artifact writer, so both apply exactly the same policy.
 bool resolveOsGroupGid(const std::string& spec, gid_t& out);
 
+// The accepted `signature_policy:` values. Shared by the config reader (which
+// rejects anything else) and by callers that want to check a value without
+// hard-coding the list.
+bool isValidSignaturePolicy(const std::string& policy);
+
+// Push the top-level `ssl:` block down into every `tcp_ssl` listener that did
+// not name its own material: `ssl.cert` fills an empty per-listener `cert`,
+// `ssl.key` an empty `key`, `ssl.ca` an empty `ca_file`. A listener that names
+// its own always wins, so the block is a default and not an override.
+//
+// Without this the top-level block was parsed, persisted and shown but read by
+// nobody, so the obvious way to configure TLS produced listeners with no
+// certificate and a handshake that died with "no shared cipher".
+//
+// logosctl-only: called from src/main.cpp (the Modern front-end). logoscore's
+// main_legacy.cpp does not call it, so the legacy tool keeps treating the
+// block exactly as it does today.
+void applySslDefaults(DaemonConfig& cfg);
+
+// Report every `tcp_ssl` listener still missing a cert or key once the
+// defaults above have been applied — such a listener binds without a
+// certificate and fails every handshake. Returns one human-readable line per
+// offending listener ("core_service tcp_ssl 0.0.0.0:8645"); empty means the
+// TLS material is complete. Also logosctl-only, for the same reason.
+std::vector<std::string> findTlsListenersMissingMaterial(const DaemonConfig& cfg);
+
+// Validate a daemon-config document (YAML already converted to JSON) and turn
+// it into a DaemonConfig, without touching disk. Returns nullopt with a
+// one-line reason in `error` for anything the daemon could not boot from: a
+// wrong top-level type, an unsupported schema version, a value of the wrong
+// type (`modules_dirs:` given a scalar), an out-of-range number, or an invalid
+// transport entry. The message names the offending key by its dotted path.
+//
+// Never throws: a hand-written config must not be able to terminate the
+// process. This is the same entry point DaemonConfigFile::read uses, so
+// `daemon config set` can validate a document *before* writing it and know
+// that anything it accepts is a document the daemon will accept too.
+std::optional<DaemonConfig> parseDaemonConfigDocument(const nlohmann::json& obj,
+                                                      std::string* error);
+
 // daemon/config.json — operator preferences. read() returns nullopt
 // when the file is missing or its schema version doesn't match;
 // callers fall through to defaults. write() is atomic (write-temp +
@@ -133,7 +214,7 @@ public:
     // Emit <configDir>/client/config.json + <configDir>/client/auto.json
     // populated as a same-host dial spec for the daemon we just bound.
     // Called by the daemon at boot after auto-issuing the `auto` token;
-    // allows `logoscore status` (and friends) to work out of the box
+    // allows `logosctl status` (and friends) to work out of the box
     // from the same machine without hand-writing a client config.
     //
     // The emitted client/config.json mirrors the daemon's resolved
@@ -169,7 +250,7 @@ public:
     //     hand-written remote-client config is never clobbered — with
     //     one exception: a file carrying an `instance_id` that doesn't
     //     match this daemon is a stale copy of *our own* generated
-    //     artifact (a persisted ~/.logoscore whose daemon was replaced,
+    //     artifact (a persisted ~/.logosctl whose daemon was replaced,
     //     e.g. a restarting container) and is refreshed in place so
     //     co-resident clients don't dial a dead instance forever. An
     //     operator-authored remote config has no `instance_id`, so it

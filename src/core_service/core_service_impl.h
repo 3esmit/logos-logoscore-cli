@@ -15,8 +15,34 @@ public:
 
     // Module lifecycle
     StdLogosResult loadModule(const std::string& name);
-    StdLogosResult unloadModule(const std::string& name);
+    // `withDependents` cascades the unload to every module that depends on
+    // `name`, leaves-first. It defaults to true at the CLI layer: unloading a
+    // module while its dependents keep running leaves them talking to a dead
+    // provider, so the cascade is the safe default and opting out is explicit.
+    StdLogosResult unloadModule(const std::string& name, bool withDependents);
     StdLogosResult reloadModule(const std::string& name);
+
+    // Re-scan the module directories so packages installed since boot become
+    // discoverable without restarting the daemon. This is what lets
+    // `install` be followed by `load` in the same session.
+    LogosMap refreshModules();
+
+    // Package operations. Split into plan/apply so the client can show what
+    // would change (and prompt) before anything is written — `--dry-run`
+    // stops after the plan. See package_ops.h for why the work happens here
+    // rather than in the client.
+    LogosMap planPackageOperation(const std::string& op,
+                                  const LogosList& names,
+                                  const LogosMap& opts);
+    LogosMap applyPackageOperation(const std::string& op,
+                                   const LogosList& names,
+                                   const LogosMap& opts);
+
+    // Fetch a .lgx without installing it. Daemon-side rather than a direct
+    // proxy to package_downloader because the downloader has no destination
+    // parameter -- it drops the file in $TMPDIR, and the move to the requested
+    // directory has to happen on the host that holds it.
+    LogosMap downloadPackage(const std::string& name, const LogosMap& opts);
 
     // Queries
     LogosList listModules(const std::string& filter);

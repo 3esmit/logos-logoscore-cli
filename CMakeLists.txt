@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(LogoscoreCLI LANGUAGES CXX)
+project(LogosctlCLI LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -81,6 +81,16 @@ else()
     message(STATUS "Using system fmt")
 endif()
 
+# ── spdlog ───────────────────────────────────────────────────────────────────
+# Its rotating file sink already implements the size cap and keep-N retention
+# the daemon log needs, and liblogos logs through spdlog anyway.
+find_package(spdlog REQUIRED)
+
+# ── yaml-cpp ─────────────────────────────────────────────────────────────────
+# The user-editable config files are YAML; everything machine-owned
+# (state.json, tokens.json, the auto token) stays JSON. See src/yaml_json.h.
+find_package(yaml-cpp REQUIRED)
+
 # ── CLI11 (header-only) ──────────────────────────────────────────────────────
 find_package(CLI11 QUIET)
 if(NOT CLI11_FOUND)
@@ -95,17 +105,18 @@ else()
     message(STATUS "Using system CLI11")
 endif()
 
-# ── logoscore executable ──────────────────────────────────────────────────────
-set(CLI_SOURCES
-    src/main.cpp
+# ── logosctl executable ──────────────────────────────────────────────────────
+set(SHARED_SOURCES
     src/config.cpp
     src/paths.cpp
+    src/yaml_json.cpp
 
     # Daemon path
     src/daemon/daemon.cpp
     src/daemon/daemon_state.cpp
     src/daemon/port_allocator.cpp
     src/daemon/token_store.cpp
+    src/daemon/log_sink.cpp
 
     # Client path
     src/client/client.cpp
@@ -125,30 +136,42 @@ set(CLI_SOURCES
     src/client/commands/issue_token_command.cpp
     src/client/commands/revoke_token_command.cpp
     src/client/commands/list_tokens_command.cpp
+    src/client/commands/package_command.cpp
+    src/client/commands/catalog_command.cpp
+    src/client/commands/config_command.cpp
 
     # Core service (in-process daemon module)
     src/core_service/core_service_impl.cpp
     src/core_service/core_service_dispatch.cpp
+    src/core_service/package_ops.cpp
 )
 
-add_executable(logoscore ${CLI_SOURCES})
+# Two front-ends over one shared runtime. logoscore is the tool that exists
+# today, kept building unchanged while logosctl is validated; logosctl is the
+# merged CLI. They differ only in main.cpp and the Config flavor it sets --
+# everything below src/daemon, src/client and src/core_service is shared.
+add_executable(logosctl  src/main.cpp        ${SHARED_SOURCES})
+add_executable(logoscore src/main_legacy.cpp ${SHARED_SOURCES})
 
-target_link_libraries(logoscore PRIVATE
+foreach(_tgt logosctl logoscore)
+target_link_libraries(${_tgt} PRIVATE
     logos_core
     nlohmann_json::nlohmann_json
     stduuid
     CLI11::CLI11
     OpenSSL::Crypto
     fmt::fmt
+    yaml-cpp::yaml-cpp
+    spdlog::spdlog
     Qt${QT_VERSION_MAJOR}::Core
     Qt${QT_VERSION_MAJOR}::RemoteObjects
 )
 
 # Link the SDK stack (provides LogosProviderObject, bridge helpers,
 # logos::transportSetToJsonString, and other symbols needed by core_service).
-target_link_libraries(logoscore PRIVATE logos-qt-sdk::logos_qt_sdk)
+target_link_libraries(${_tgt} PRIVATE logos-qt-sdk::logos_qt_sdk)
 
-target_include_directories(logoscore PRIVATE
+target_include_directories(${_tgt} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${LOGOS_CPP_SDK_ROOT}/include/cpp
     ${LOGOS_QT_SDK_ROOT}/include
@@ -167,14 +190,16 @@ if(APPLE)
         list(APPEND _rpath "${_qt_lib_dir}")
     endif()
     list(REMOVE_DUPLICATES _rpath)
-    set_target_properties(logoscore PROPERTIES
+    set_target_properties(${_tgt} PROPERTIES
         INSTALL_RPATH "${_rpath}"
         BUILD_WITH_INSTALL_RPATH TRUE)
 else()
-    set_target_properties(logoscore PROPERTIES
+    set_target_properties(${_tgt} PROPERTIES
         INSTALL_RPATH "$ORIGIN/../lib"
         BUILD_WITH_INSTALL_RPATH TRUE)
 endif()
+
+endforeach()
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
 find_package(GTest QUIET)
@@ -196,6 +221,7 @@ include(GoogleTest)
 add_subdirectory(tests)
 
 # ── Install ───────────────────────────────────────────────────────────────────
-install(TARGETS logoscore
+
+install(TARGETS logosctl logoscore
     RUNTIME DESTINATION bin
 )
