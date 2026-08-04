@@ -1,7 +1,9 @@
 #include "core_service_impl.h"
+#include "../module_call_timeout.h"
 #include "logos_core.h"
 #include <logos_api.h>
 #include <logos_api_client.h>
+#include <logos_mode.h>
 
 #include <QCoreApplication>
 #include <algorithm>
@@ -359,7 +361,8 @@ StdLogosResult CoreServiceImpl::callModuleMethod(const std::string& module,
     }
 
     // The nlohmann::json overload handles QVariant<->json conversion internally.
-    nlohmann::json ret = moduleClient->invokeRemoteMethod(module, method, args);
+    nlohmann::json ret = moduleClient->invokeRemoteMethod(
+        module, method, args, Timeout(logoscore::kModuleCallTimeoutMs));
 
     if (ret.is_null()) {
         result["status"] = "error";

@@ -949,6 +949,33 @@ TEST_F(LoadedModuleTest, AsyncEchoWithDelay) {
     EXPECT_GE(ms, 200) << "echoWithDelay returned too fast (" << ms << "ms)";
 }
 
+// `call` crosses two synchronous SDK proxy legs: client -> core_service and
+// core_service -> module. The SDK's generic Timeout() is 20 seconds, but a
+// normal module call can take longer (for example cold wallet initialization).
+// This must finish as one successful envelope rather than timing out at either
+// proxy while the target continues mutating state in the background.
+TEST_F(LoadedModuleTest, ModuleCallTimeoutCoversBothProxyHops) {
+    constexpr int kDelayMs = 21'000;
+    constexpr int kCommandBudgetSecs = 35;
+    std::string out;
+    const auto start = std::chrono::steady_clock::now();
+
+    ASSERT_EQ(s_d->run("call test_basic_module echoWithDelay module-call-timeout " +
+                       std::to_string(kDelayMs),
+                       &out, kCommandBudgetSecs),
+              0)
+        << out;
+
+    const nlohmann::json env = lastJsonObject(out);
+    EXPECT_EQ(env.value("status", std::string{}), "ok") << out;
+    EXPECT_EQ(env.value("result", std::string{}), "module-call-timeout") << out;
+
+    const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    EXPECT_GE(elapsedMs, kDelayMs)
+        << "echoWithDelay returned too fast (" << elapsedMs << "ms)";
+}
+
 // ── Events: subscribe via `watch`, fire via a method call ────────────────────
 
 // Re-emit the event on a cadence while polling the watch log instead of
