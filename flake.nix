@@ -8,13 +8,13 @@
     # public symbols (e.g. logos::transportSetToJsonString) without
     # relying on the symbol surviving liblogos_core's link-time
     # dead-strip. liblogos's own SDK pin still drives transitive deps.
-    logos-cpp-sdk.url = "github:logos-co/logos-cpp-sdk";
+    logos-cpp-sdk.url = "github:3esmit/logos-cpp-sdk?rev=ec020bd06776a71b204406384db2b194001bc543";
     logos-cpp-sdk.inputs.logos-protocol.follows = "logos-protocol";
-    logos-protocol.url = "github:logos-co/logos-protocol";
-    logos-qt-sdk.url = "github:logos-co/logos-qt-sdk";
+    logos-protocol.url = "github:3esmit/logos-protocol?rev=6086c922bf27ea53e073e92c997421c6e91baacd";
+    logos-qt-sdk.url = "github:3esmit/logos-qt-sdk?rev=f6ba4309758755a0517eaed106d97df003cd9808";
     logos-qt-sdk.inputs.logos-protocol.follows = "logos-protocol";
     logos-qt-sdk.inputs.logos-cpp-sdk.follows = "logos-cpp-sdk";
-    logos-liblogos.url = "github:logos-co/logos-liblogos";
+    logos-liblogos.url = "github:3esmit/logos-liblogos?rev=51a34dd1d9417167b38bd1fe69b02585bab17c9d";
     # liblogos is linked INTO this CLI, so its logos-protocol is the one the
     # crashing code path actually runs. Without this follows it brought its own,
     # older protocol while cpp-sdk and qt-sdk followed the root pin — three
@@ -22,7 +22,7 @@
     # nothing. Measured: 4 SIGSEGVs in 2000 client calls with the root pin
     # already on the fixed protocol.
     logos-liblogos.inputs.logos-protocol.follows = "logos-protocol";
-    logos-capability-module.url = "github:logos-co/logos-capability-module";
+    logos-capability-module.url = "github:3esmit/logos-capability-module?rev=1b6cc7856760114b2b903079e309dbee85968346";
     # Real test-module plugins (test_basic_module) used by the
     # daemon-backed integration tests in tests/test_integration.cpp.
     logos-test-modules.url = "github:logos-co/logos-test-modules";
