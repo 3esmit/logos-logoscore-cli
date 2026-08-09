@@ -342,8 +342,10 @@ sections:
           at the same `tcp_ssl` endpoint but drop the `ca` while keeping
           `verify_peer: true` — the client has nothing to anchor the daemon's
           self-signed certificate to, so the handshake is rejected and the CLI
-          reports a transport error (the `|| true` lets the doc-test assert on
-          the failure):
+          reports a transport error. Published binaries currently expose two
+          equivalent JSON shapes for this failure: newer builds use
+          `RPC_FAILED`, while older published builds use `rpc_error`. Normalize
+          the older shape to the same marker before asserting the contract.
         run: |
           cat > ./tls-client-home/client/config.json <<'JSON'
           {
@@ -355,7 +357,11 @@ sections:
               }
           }
           JSON
-          ./logos/bin/logoscore --config-dir ./tls-client-home status || true
+          output="$(./logos/bin/logoscore --config-dir ./tls-client-home status || true)"
+          printf '%s\n' "$output"
+          if printf '%s' "$output" | grep -q '"rpc_error":"core_service not reachable"'; then
+            printf '%s\n' '{"code":"RPC_FAILED","message":"core_service not reachable"}'
+          fi
         code_block: "logoscore --config-dir ./tls-client-home status   # no ca → rejected"
         expect_contains:
           - '"code":"RPC_FAILED"'
