@@ -402,7 +402,7 @@ protected:
 
 class ModuleMetadataReloadTest : public ::testing::Test {
 protected:
-    LogoscoreDaemon d;
+    LogosctlDaemon d;
     fs::path copiedModules;
 
     void SetUp() override {
@@ -496,7 +496,7 @@ TEST_F(ErrorPathTest, StoppedDaemonQueriesReportRpcFailure)
         {"list-modules", "listModules RPC call failed."},
         {"stats", "getModuleStats RPC call failed."},
     }};
-    LogoscoreDaemon& daemon = d;
+    LogosctlDaemon& daemon = d;
     std::vector<std::thread> workers;
     workers.reserve(queries.size());
     for (auto& query : queries) {
