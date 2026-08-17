@@ -1,6 +1,7 @@
 #include "client.h"
 #include "../config.h"
 #include "../module_call_timeout.h"
+#include "../platform_compat.h"
 #include "client_state.h"
 
 #include <logos_api.h>
@@ -27,12 +28,34 @@ struct RpcClient::Impl {
     ClientState clientState;
 
     // Helper: invoke a core_service method via the nlohmann::json overload.
+    //
+    // `timeoutMs` exists because the transport's default deadline is 20
+    // seconds (logos::Timeout), which is right for a status query and far too
+    // short for anything that touches the network. An install that outran it
+    // reported "RPC call failed" while the daemon carried on and finished the
+    // job -- the package landed on disk and the user was told it had not.
     nlohmann::json invoke(const std::string& method,
                           const nlohmann::json& args = nlohmann::json::array(),
-                          Timeout timeout = Timeout()) {
-        return coreService->invokeRemoteMethod("core_service", method, args, timeout);
+                          int timeoutMs = 0) {
+        if (timeoutMs > 0) {
+            return coreService->invokeRemoteMethod("core_service", method, args,
+                                                   Timeout(timeoutMs));
+        }
+        return coreService->invokeRemoteMethod("core_service", method, args);
     }
 };
+
+namespace {
+
+// Deadlines for the operations that leave the machine. The transport's default
+// is 20 seconds -- fine for "is the daemon up", useless for "fetch and install
+// a blockchain node". These are generous on purpose: the cost of waiting too
+// long is a slow command, the cost of waiting too little is telling someone
+// their install failed while it is still running and about to succeed.
+constexpr int kCatalogTimeoutMs  = 2  * 60 * 1000;   // resolve against the catalog
+constexpr int kTransferTimeoutMs = 30 * 60 * 1000;   // download + install
+
+} // namespace
 
 RpcClient::RpcClient()
     : d(new Impl)
@@ -52,9 +75,9 @@ bool RpcClient::connect()
     if (!d->clientState.fileOk) {
         m_lastError = "No client config at " +
             ClientStateFile::filePath() +
-            ". Either run the daemon locally first (it auto-emits a "
-            "config), pass client flags + --persist-config, or write "
-            "client/config.json + the matching token file by hand.";
+            ". Start a daemon in this session (it writes one on boot), or "
+            "install a dial spec with `logosctl client config set FILE` "
+            "alongside the matching token file.";
         return false;
     }
 
@@ -65,7 +88,7 @@ bool RpcClient::connect()
 
     if (d->token.empty()) {
         m_lastError = fmt::format(
-            "No authentication token. Expected at {} or in $LOGOSCORE_TOKEN.",
+            "No authentication token. Expected at {} or in $LOGOSCTL_TOKEN.",
             Config::clientTokenPath(d->clientState.tokenFile));
         return false;
     }
@@ -76,7 +99,7 @@ bool RpcClient::connect()
     // remote clients (TCP / TCP-SSL) don't need it.
     if (!d->clientState.instanceId.empty()) {
         d->instanceId = d->clientState.instanceId;
-        setenv("LOGOS_INSTANCE_ID", d->instanceId.c_str(), 1);
+        logosctl::setEnvVar("LOGOS_INSTANCE_ID", d->instanceId.c_str());
     }
 
     // Keep the legacy self-identity entry (the CLI's LogosAPI is named
@@ -101,7 +124,7 @@ bool RpcClient::connect()
     // core_service is mandatory.
     auto coreIt = d->clientState.daemon.find("core_service");
     if (coreIt == d->clientState.daemon.end()) {
-        m_lastError = "client/config.json: 'daemon.core_service' is required.";
+        m_lastError = ClientStateFile::filePath() + ": 'daemon.core_service' is required.";
         return false;
     }
     const LogosTransportConfig coreServiceCfg = toCfg(coreIt->second);
@@ -146,12 +169,64 @@ LogosMap RpcClient::loadModule(const std::string& name)
                     {"message", fmt::format("loadModule('{}') RPC call failed.", name)}};
 }
 
-LogosMap RpcClient::unloadModule(const std::string& name)
+LogosMap RpcClient::unloadModule(const std::string& name, bool withDependents)
 {
-    nlohmann::json ret = d->invoke("unloadModule", nlohmann::json::array({name}));
+    nlohmann::json ret = d->invoke("unloadModule",
+                                   nlohmann::json::array({name, withDependents}));
     if (ret.is_object()) return ret;
     return LogosMap{{"status","error"},{"code","RPC_FAILED"},
                     {"message", fmt::format("unloadModule('{}') RPC call failed.", name)}};
+}
+
+LogosMap RpcClient::refreshModules()
+{
+    nlohmann::json ret = d->invoke("refreshModules", nlohmann::json::array());
+    if (ret.is_object()) return ret;
+    return LogosMap{{"status","error"},{"code","RPC_FAILED"},
+                    {"message", "refreshModules() RPC call failed."}};
+}
+
+// ---------------------------------------------------------------------------
+// Package operations — delegate to core_service
+// ---------------------------------------------------------------------------
+
+LogosMap RpcClient::planPackageOperation(const std::string& op, const LogosList& names,
+                                          const LogosMap& opts)
+{
+    // Resolving a plan reads the catalog, so it is network-bound too -- less
+    // so than the install itself, hence the smaller budget.
+    nlohmann::json ret = d->invoke("planPackageOperation",
+                                   nlohmann::json::array({op, names, opts}),
+                                   kCatalogTimeoutMs);
+    if (ret.is_object()) return ret;
+    return LogosMap{{"status","error"},{"code","RPC_FAILED"},
+                    {"message", fmt::format("planPackageOperation('{}') RPC call failed.", op)}};
+}
+
+LogosMap RpcClient::applyPackageOperation(const std::string& op, const LogosList& names,
+                                           const LogosMap& opts)
+{
+    // Installs pull from the network and can take minutes on a cold catalog;
+    // the default 20s deadline is far too short for that. This comment used to
+    // sit above a call that passed no timeout at all.
+    nlohmann::json ret = d->invoke("applyPackageOperation",
+                                   nlohmann::json::array({op, names, opts}),
+                                   kTransferTimeoutMs);
+    if (ret.is_object()) return ret;
+    return LogosMap{{"status","error"},{"code","RPC_FAILED"},
+                    {"message", fmt::format("applyPackageOperation('{}') RPC call failed.", op)}};
+}
+
+LogosMap RpcClient::downloadPackage(const std::string& name, const LogosMap& opts)
+{
+    // Same deadline reasoning as applyPackageOperation: this is a network
+    // fetch, not a local query.
+    nlohmann::json ret = d->invoke("downloadPackage",
+                                   nlohmann::json::array({name, opts}),
+                                   kTransferTimeoutMs);
+    if (ret.is_object()) return ret;
+    return LogosMap{{"status","error"},{"code","RPC_FAILED"},
+                    {"message", fmt::format("downloadPackage('{}') RPC call failed.", name)}};
 }
 
 LogosMap RpcClient::reloadModule(const std::string& name)
@@ -208,7 +283,7 @@ LogosMap RpcClient::callModuleMethod(const std::string& module,
 {
     nlohmann::json ret = d->invoke("callModuleMethod",
                                    nlohmann::json::array({module, method, args}),
-                                   Timeout(logoscore::kModuleCallTimeoutMs));
+                                   logoscore::kModuleCallTimeoutMs);
     if (ret.is_object()) return ret;
     return LogosMap{{"status","error"},{"code","RPC_FAILED"},
                     {"message", fmt::format("callModuleMethod('{}','{}') RPC call failed.",
@@ -258,7 +333,7 @@ bool RpcClient::watchModuleEvents(const std::string& module,
             auto now = std::chrono::system_clock::now();
             std::time_t tt = std::chrono::system_clock::to_time_t(now);
             struct tm utc{};
-            gmtime_r(&tt, &utc);
+            logosctl::gmtimeR(&tt, &utc);
             char tsBuf[32];
             std::strftime(tsBuf, sizeof(tsBuf), "%Y-%m-%dT%H:%M:%SZ", &utc);
 

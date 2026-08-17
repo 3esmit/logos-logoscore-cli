@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 #
-# Execute every logoscore doc-test end-to-end and regenerate its Markdown.
+# Execute every logosctl doc-test end-to-end and regenerate its Markdown.
 #
 # Each `*.test.yaml` in this directory is a self-contained doc-test:
-#   - logoscore-daemon.test.yaml              — daemon lifecycle (local same-host)
-#   - logoscore-transports.test.yaml          — reaching the daemon over TCP / TCP+TLS
-#   - logoscore-concurrent-blocking.test.yaml — many concurrent clients vs a blocking
+#   - logosctl-daemon.test.yaml              — daemon lifecycle (local same-host)
+#   - logosctl-transports.test.yaml          — reaching the daemon over TCP / TCP+TLS
+#   - logosctl-concurrent-blocking.test.yaml — many concurrent clients vs a blocking
 #                                               module method (serialization, no crash)
 #
 # The runner is the shared `doctest` CLI
 # (https://github.com/logos-co/logos-doctest), invoked directly via its flake.
-# `doctest run` executes every command in a temp directory (building logoscore,
+# `doctest run` executes every command in a temp directory (building logosctl,
 # preparing modules, starting the daemon, calling methods) and asserts on the
 # output; `doctest generate` renders the same spec to Markdown under outputs/;
 # `doctest clean` strips build artifacts so only the generated docs remain.
@@ -19,7 +19,7 @@
 # set DOCTEST, e.g.:  DOCTEST="nix run path:../../logos-doctest --" ./run.sh
 #
 # By default every spec runs. Pass spec filenames as arguments to run a subset,
-# e.g.:  ./run.sh logoscore-transports.test.yaml
+# e.g.:  ./run.sh logosctl-transports.test.yaml
 #
 set -euo pipefail
 

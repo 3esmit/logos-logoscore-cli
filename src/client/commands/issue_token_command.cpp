@@ -1,4 +1,5 @@
 #include "issue_token_command.h"
+#include "../../platform_compat.h"
 
 #include "../../config.h"
 #include "../../daemon/token_store.h"
@@ -58,7 +59,7 @@ std::optional<std::string> resolveExpires(const std::string& s)
                        + std::chrono::seconds(seconds);
         const time_t tt = std::chrono::system_clock::to_time_t(now);
         struct tm utc{};
-        gmtime_r(&tt, &utc);
+        logosctl::gmtimeR(&tt, &utc);
         std::ostringstream ss;
         ss << std::put_time(&utc, "%Y-%m-%dT%H:%M:%SZ");
         return ss.str();
@@ -92,11 +93,10 @@ int IssueTokenCommand::execute(const std::vector<std::string>& args)
                  "Reject this token over non-LocalSocket transports");
 
     try {
-        std::vector<std::string> argsCopy(args.rbegin(), args.rend());
-        cli.parse(argsCopy);
+        parseArgs(cli, args);
     } catch (const CLI::ParseError&) {
         output().printError("INVALID_ARGS",
-            "Usage: logoscore issue-token --name NAME [--expires DUR] [--replace] [--local-only]");
+            "Usage: logosctl token issue --name NAME [--expires DUR] [--replace] [--local-only]");
         return 1;
     }
 

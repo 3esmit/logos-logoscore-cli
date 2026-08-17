@@ -1,5 +1,6 @@
 #include "core_service_impl.h"
 #include "../module_call_timeout.h"
+#include "package_ops.h"
 #include "logos_core.h"
 #include <logos_api.h>
 #include <logos_api_client.h>
@@ -142,9 +143,13 @@ StdLogosResult CoreServiceImpl::loadModule(const std::string& name)
     return {true, result};
 }
 
-StdLogosResult CoreServiceImpl::unloadModule(const std::string& name)
+StdLogosResult CoreServiceImpl::unloadModule(const std::string& name, bool withDependents)
 {
-    logos_core_unload_module(name.c_str(), false);
+    // Snapshot before the call so we can report which *dependents* came down
+    // as a side effect, mirroring how loadModule reports dependencies_loaded.
+    std::vector<std::string> before = getLoadedModuleNames();
+
+    logos_core_unload_module(name.c_str(), withDependents);
 
     auto loaded = getLoadedModuleNames();
     if (containsName(loaded, name)) {
@@ -155,10 +160,99 @@ StdLogosResult CoreServiceImpl::unloadModule(const std::string& name)
         return {false, errResult, "Module '" + name + "' is not loaded."};
     }
 
+    std::unordered_set<std::string> afterSet(loaded.begin(), loaded.end());
+    LogosList dependentsUnloaded = LogosList::array();
+    for (const auto& wasLoaded : before) {
+        if (wasLoaded != name && afterSet.find(wasLoaded) == afterSet.end())
+            dependentsUnloaded.push_back(wasLoaded);
+    }
+
     LogosMap result;
     result["status"] = "ok";
     result["module"] = name;
+    result["dependents_unloaded"] = dependentsUnloaded;
     return {true, result};
+}
+
+namespace {
+
+// Translate the wire shape into package_ops::Options.
+package_ops::Options toOptions(const LogosMap& opts)
+{
+    package_ops::Options o;
+    o.withDeps       = opts.value("withDeps", true);
+    o.withDependents = opts.value("withDependents", true);
+    o.version        = opts.value("version", std::string{});
+    o.rootHash       = opts.value("rootHash", std::string{});
+    o.catalog        = opts.value("catalog", std::string{});
+    if (opts.contains("localFiles") && opts["localFiles"].is_array()) {
+        for (const auto& f : opts["localFiles"])
+            o.localFiles.push_back(f.get<std::string>());
+    }
+    return o;
+}
+
+std::optional<package_ops::Op> toOp(const std::string& op)
+{
+    if (op == "install") return package_ops::Op::Install;
+    if (op == "upgrade") return package_ops::Op::Upgrade;
+    if (op == "remove")  return package_ops::Op::Remove;
+    return std::nullopt;
+}
+
+std::vector<std::string> toNames(const LogosList& names)
+{
+    std::vector<std::string> out;
+    if (names.is_array())
+        for (const auto& n : names) out.push_back(n.get<std::string>());
+    return out;
+}
+
+} // namespace
+
+LogosMap CoreServiceImpl::planPackageOperation(const std::string& op,
+                                               const LogosList& names,
+                                               const LogosMap& opts)
+{
+    auto parsed = toOp(op);
+    if (!parsed)
+        return LogosMap{{"status", "error"}, {"code", "INVALID_ARGS"},
+                        {"message", "Unknown package operation: " + op}};
+    return package_ops::plan(m_api, *parsed, toNames(names), toOptions(opts));
+}
+
+LogosMap CoreServiceImpl::applyPackageOperation(const std::string& op,
+                                                const LogosList& names,
+                                                const LogosMap& opts)
+{
+    auto parsed = toOp(op);
+    if (!parsed)
+        return LogosMap{{"status", "error"}, {"code", "INVALID_ARGS"},
+                        {"message", "Unknown package operation: " + op}};
+    return package_ops::apply(m_api, *parsed, toNames(names), toOptions(opts));
+}
+
+LogosMap CoreServiceImpl::downloadPackage(const std::string& name,
+                                          const LogosMap& opts)
+{
+    const std::string dest = opts.is_object()
+        ? opts.value("output", std::string{})
+        : std::string{};
+    return package_ops::download(m_api, name, toOptions(opts), dest);
+}
+
+LogosMap CoreServiceImpl::refreshModules()
+{
+    logos_core_refresh_modules();
+
+    LogosList known = LogosList::array();
+    for (const auto& n : getKnownModuleNames())
+        known.push_back(n);
+
+    LogosMap result;
+    result["status"] = "ok";
+    result["known_modules"] = known;
+    return result;
 }
 
 StdLogosResult CoreServiceImpl::reloadModule(const std::string& name)
@@ -356,7 +450,7 @@ StdLogosResult CoreServiceImpl::callModuleMethod(const std::string& module,
     if (!moduleClient) {
         result["status"] = "error";
         result["code"] = "MODULE_NOT_LOADED";
-        result["message"] = "Module '" + module + "' is not loaded. Load it with: logoscore load-module " + module;
+        result["message"] = "Module '" + module + "' is not loaded. Load it with: logosctl module load " + module;
         return {false, result, "Module '" + module + "' is not loaded."};
     }
 

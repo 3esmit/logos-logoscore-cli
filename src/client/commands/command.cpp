@@ -12,6 +12,9 @@
 #include "issue_token_command.h"
 #include "revoke_token_command.h"
 #include "list_tokens_command.h"
+#include "package_command.h"
+#include "catalog_command.h"
+#include "config_command.h"
 
 Command::Command(Client& client, Output& output)
     : m_client(client), m_output(output)
@@ -48,7 +51,9 @@ std::vector<std::string> knownSubcommands()
         "list-modules", "module-info", "info",
         "call", "module",  // "module" for verbose call syntax
         "watch", "stats", "stop",
-        "issue-token", "revoke-token", "list-tokens"
+        "issue-token", "revoke-token", "list-tokens",
+        "package", "catalog", "key",
+        "daemon-config", "client-config", "client"
     };
 }
 
@@ -80,6 +85,16 @@ std::unique_ptr<Command> createCommand(const std::string& name, Client& client, 
         return std::make_unique<RevokeTokenCommand>(client, output);
     if (name == "list-tokens")
         return std::make_unique<ListTokensCommand>(client, output);
+    if (name == "package")
+        return std::make_unique<PackageCommand>(client, output);
+    if (name == "catalog")
+        return std::make_unique<CatalogCommand>(client, output);
+    if (name == "key")
+        return std::make_unique<KeyCommand>(client, output);
+    if (name == "daemon-config")
+        return std::make_unique<ConfigCommand>(client, output, /*daemonSide=*/true);
+    if (name == "client-config" || name == "client")
+        return std::make_unique<ConfigCommand>(client, output, /*daemonSide=*/false);
 
     return nullptr;
 }

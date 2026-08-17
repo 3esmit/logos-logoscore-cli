@@ -27,17 +27,28 @@ public:
     // "defaults") recorded into state.json's `config_source` field
     // so operators can tell at a glance where the running daemon's
     // config came from.
-    // If `persistConfig` is true, the daemon writes `cfg` to
-    // daemon/config.json after transports have successfully bound
-    // and state.json is on disk. The persisted file holds operator
-    // *intent* (port=0 stays 0) — the actually-bound port lives in
-    // state.json. No-op when false, which is the default outcome of
-    // a launch that didn't pass `--persist-config`.
+    // `persistConfig` writes the merged config back to disk. Only the legacy
+    // logoscore front-end passes it: logosctl has no merge layer to persist,
+    // since its config file *is* the source of truth.
     static int start(int argc, char* argv[],
                      const DaemonConfig& cfg,
                      const std::string& configSource,
+                     // No default arguments. They are both bool and adjacent,
+                     // so a defaulted tail let a caller drop one and have the
+                     // other silently slide into its place -- which is exactly
+                     // what happened: logosctl passed g_verbose as
+                     // persistConfig for the whole life of the binary, and it
+                     // compiled. Requiring both makes that a build error.
                      bool persistConfig,
-                     bool verbose = false);
+                     bool verbose);
+
+#ifdef _WIN32
+    // Entry point for the Win32 console control handler, which lives in an
+    // anonymous namespace in daemon.cpp and so cannot reach the private
+    // handler directly. Posts quit() to the main thread; safe to call from the
+    // dedicated thread Windows runs the control routine on.
+    static void requestShutdown();
+#endif
 
 private:
     static void setupSignalHandlers();

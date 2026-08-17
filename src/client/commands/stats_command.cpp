@@ -6,10 +6,9 @@ int StatsCommand::execute(const std::vector<std::string>& args)
     CLI::App cli{"stats"};
     cli.set_help_flag();
     try {
-        auto argsCopy = args;
-        cli.parse(argsCopy);
+        parseArgs(cli, args);
     } catch (const CLI::ParseError&) {
-        output().printError("INVALID_ARGS", "Usage: logoscore stats");
+        output().printError("INVALID_ARGS", "Usage: logosctl stats");
         return 1;
     }
 

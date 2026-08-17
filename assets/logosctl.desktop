@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Logosctl
+Exec=logosctl
+Icon=logosctl
+Terminal=true
+Categories=Utility;

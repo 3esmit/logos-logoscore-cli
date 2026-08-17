@@ -19,8 +19,28 @@ public:
 
     // Module lifecycle
     virtual LogosMap loadModule(const std::string& name) = 0;
-    virtual LogosMap unloadModule(const std::string& name) = 0;
+    // Cascades to dependents unless the caller opts out (`--no-dependents`).
+    virtual LogosMap unloadModule(const std::string& name,
+                                  bool withDependents) = 0;
     virtual LogosMap reloadModule(const std::string& name) = 0;
+
+    // Re-scan the daemon's module directories after an install.
+    virtual LogosMap refreshModules() = 0;
+
+    // Package operations. Split so the client can show what would change and
+    // prompt before anything is written; the work itself happens daemon-side
+    // (see src/core_service/package_ops.h).
+    virtual LogosMap planPackageOperation(const std::string& op,
+                                          const LogosList& names,
+                                          const LogosMap& opts) = 0;
+    virtual LogosMap applyPackageOperation(const std::string& op,
+                                           const LogosList& names,
+                                           const LogosMap& opts) = 0;
+    // Fetch without installing. Goes through the daemon rather than straight
+    // to package_downloader because the downloaded file lands on the daemon's
+    // filesystem, and so must the move into the requested directory.
+    virtual LogosMap downloadPackage(const std::string& name,
+                                     const LogosMap& opts) = 0;
 
     // Queries
     virtual LogosList listModules(const std::string& filter) = 0;
@@ -54,8 +74,14 @@ public:
     std::string lastError() const override;
 
     LogosMap loadModule(const std::string& name) override;
-    LogosMap unloadModule(const std::string& name) override;
+    LogosMap unloadModule(const std::string& name, bool withDependents) override;
     LogosMap reloadModule(const std::string& name) override;
+    LogosMap refreshModules() override;
+    LogosMap planPackageOperation(const std::string& op, const LogosList& names,
+                                  const LogosMap& opts) override;
+    LogosMap applyPackageOperation(const std::string& op, const LogosList& names,
+                                   const LogosMap& opts) override;
+    LogosMap downloadPackage(const std::string& name, const LogosMap& opts) override;
     LogosList listModules(const std::string& filter) override;
     LogosMap getStatus() override;
     LogosMap getModuleInfo(const std::string& name) override;
