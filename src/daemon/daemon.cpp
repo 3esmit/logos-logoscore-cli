@@ -1,12 +1,16 @@
 #include "daemon.h"
+
+#include <spdlog/spdlog.h>
 #include "daemon_state.h"
 #include "port_allocator.h"
 #include "token_store.h"
+#include "log_sink.h"
 #include "../config.h"
 #include "../paths.h"
 #include "logos_core.h"
 
 #include <logos_api.h>
+#include <logos_api_client.h>
 #include <logos_api_provider.h>
 #include <logos_socket_paths.h>
 #include <logos_transport_config.h>
@@ -30,28 +34,97 @@
 #include <random>
 #include <string>
 #include <vector>
+#include "../platform_compat.h"
+#include "../process_util.h"
+
+#ifdef _WIN32
+#include <process.h>   // getpid — mingw-w64 puts it here, not in unistd.h
+#include <windows.h>
+#else
 #include <unistd.h>
+#endif
 
 static volatile sig_atomic_t g_shutdownRequested = 0;
 
+#ifndef _WIN32
 // Self-pipe: the handler write()s one byte (async-signal-safe), and a
 // QSocketNotifier on the read end calls QCoreApplication::quit() in normal
 // context — quit() itself is not async-signal-safe to call from a handler.
 static int g_signalPipe[2] = {-1, -1};
+#endif
 
+// Ask the event loop to leave exec(), from wherever we are.
+//
+// On POSIX this runs in a signal handler and must stay async-signal-safe,
+// which is what the self-pipe is for. On Windows there is no self-pipe here,
+// and the reason is not stylistic: QEventDispatcherWin32 implements
+// QSocketNotifier with WSAAsyncSelect, which requires a real SOCKET. Handing
+// it a CRT pipe fd fails with WSAENOTSOCK, the dispatcher DISCARDS the return
+// value, and the notifier simply never fires — a daemon that ignores Ctrl-C
+// with no diagnostic at all. What Windows does instead is run the console
+// control routine on a dedicated thread the OS spawns for it, so the
+// constraint there is threading, not signal safety: post to the main thread.
 void Daemon::signalHandler(int signal)
 {
     (void)signal;
     g_shutdownRequested = 1;
+#ifdef _WIN32
+    if (QCoreApplication::instance())
+        QMetaObject::invokeMethod(QCoreApplication::instance(), "quit",
+                                  Qt::QueuedConnection);
+#else
     if (g_signalPipe[1] != -1) {
         const char byte = 1;
         ssize_t n = ::write(g_signalPipe[1], &byte, 1);
         (void)n;
     }
+#endif
 }
+
+#ifdef _WIN32
+namespace {
+// Ctrl-C, Ctrl-Break and the console-window/logoff/shutdown events all arrive
+// here. Returning TRUE means "handled", which for CTRL_C_EVENT stops the
+// default terminate-the-process behaviour and lets the shutdown below unwind
+// normally (unlinking state.json, closing the QtRO pipes).
+//
+// For CTRL_CLOSE/LOGOFF/SHUTDOWN Windows grants a bounded grace period and
+// then kills the process regardless — that is the OS contract, not something
+// this handler can extend.
+BOOL WINAPI consoleCtrlHandler(DWORD type)
+{
+    switch (type) {
+    case CTRL_C_EVENT:
+    case CTRL_BREAK_EVENT:
+    case CTRL_CLOSE_EVENT:
+    case CTRL_LOGOFF_EVENT:
+    case CTRL_SHUTDOWN_EVENT:
+        Daemon::requestShutdown();
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+}  // namespace
+
+void Daemon::requestShutdown() { signalHandler(SIGTERM); }
+#endif
 
 void Daemon::setupSignalHandlers()
 {
+#ifdef _WIN32
+    // Ctrl-C reaches a console process through this, not through signal():
+    // the CRT's SIGINT emulation is itself implemented on top of it, and only
+    // this form sees CTRL_CLOSE_EVENT (the window's X button).
+    ::SetConsoleCtrlHandler(&consoleCtrlHandler, TRUE);
+
+    // Windows has no way for one process to send SIGTERM to another, so a
+    // raise() from inside this process is the only thing that can arrive here.
+    // Registered anyway so that path shuts down the same way rather than
+    // taking the CRT default of terminating outright.
+    std::signal(SIGINT, &Daemon::signalHandler);
+    std::signal(SIGTERM, &Daemon::signalHandler);
+#else
     // Create the self-pipe and wire its read end to a QSocketNotifier that
     // performs the actual (non-async-signal-safe) quit() in normal context.
     if (::pipe(g_signalPipe) == 0) {
@@ -72,6 +145,7 @@ void Daemon::setupSignalHandlers()
     sa.sa_flags = 0;
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
+#endif
 }
 
 namespace {
@@ -155,6 +229,86 @@ std::vector<TransportInfo> toAdvertised(const LogosTransportSet& set)
     return out;
 }
 
+// Load the bundled package modules and point package_manager at this
+// session's directories. Best-effort throughout: a daemon that cannot manage
+// packages is still fully usable for loading and calling modules, so nothing
+// here is allowed to abort startup.
+void bootstrapPackageModules(LogosAPI* api,
+                             const std::string& bundledDir,
+                             const std::string& signaturePolicy,
+                             bool verbose)
+{
+    for (const char* name : {"package_manager", "package_downloader"}) {
+        if (!logos_core_load_module(name, /*with_dependencies=*/true)) {
+            fprintf(stderr,
+                    "Warning: failed to load bundled module '%s'. Package "
+                    "commands will be unavailable in this session.\n", name);
+            return;
+        }
+        if (verbose)
+            fprintf(stderr, "Loaded bundled module: %s\n", name);
+    }
+
+    LogosAPIClient* pm = api ? api->getClient("package_manager") : nullptr;
+    if (!pm) {
+        fprintf(stderr,
+                "Warning: could not reach package_manager to configure its "
+                "directories. Package commands will not see this session's "
+                "installed packages.\n");
+        return;
+    }
+
+    // Embedded (read-only, ships with the binary) vs user (writable, this
+    // session). The manager scans both and lets the user copy win on a name
+    // collision, which is how a session can override a bundled module.
+    // bundledDir is <bin>/../modules; its plugins sibling is alongside it.
+    if (!bundledDir.empty()) {
+        const std::string bundledPlugins =
+            (std::filesystem::path(bundledDir).parent_path() / "plugins").string();
+        pm->invokeRemoteMethod("package_manager", "setEmbeddedModulesDirectory",
+                               nlohmann::json::array({bundledDir}));
+        pm->invokeRemoteMethod("package_manager", "setEmbeddedUiPluginsDirectory",
+                               nlohmann::json::array({bundledPlugins}));
+    }
+    pm->invokeRemoteMethod("package_manager", "setUserModulesDirectory",
+                           nlohmann::json::array({Config::modulesDir()}));
+    pm->invokeRemoteMethod("package_manager", "setUserUiPluginsDirectory",
+                           nlohmann::json::array({Config::pluginsDir()}));
+
+    // Trust is per-session: the keyring lives inside the config dir so that
+    // copying a session carries its trust assumptions with it, and two
+    // sessions can disagree about which signers they accept.
+    pm->invokeRemoteMethod("package_manager", "setKeyringDirectory",
+                           nlohmann::json::array({Config::keyringDir()}));
+
+    // ...and so is the policy applied to what those keys say about a package.
+    // The module defaults to `warn`, so an unset `signature_policy:` is left
+    // alone rather than restated; anything else is the operator asking for a
+    // different answer and has to reach the module, or `require` would be a
+    // setting that reads back correctly and enforces nothing.
+    // The value is allowlisted by the config reader, so by here it is one of
+    // none | warn | require.
+    if (!signaturePolicy.empty()) {
+        pm->invokeRemoteMethod("package_manager", "setSignaturePolicy",
+                               nlohmann::json::array({signaturePolicy}));
+    }
+
+    // A crash mid-dialog in a previous run can leave the module's single
+    // gated-operation slot occupied, which would reject every subsequent
+    // install. Basecamp clears it at startup for the same reason.
+    pm->invokeRemoteMethod("package_manager", "resetPendingAction",
+                           nlohmann::json::array());
+
+    if (verbose)
+        fprintf(stderr,
+                "Configured package_manager: user=%s embedded=%s keyring=%s "
+                "signature_policy=%s\n",
+                Config::modulesDir().c_str(), bundledDir.c_str(),
+                Config::keyringDir().c_str(),
+                signaturePolicy.empty() ? "(module default)"
+                                        : signaturePolicy.c_str());
+}
+
 } // namespace
 
 int Daemon::start(int argc, char* argv[],
@@ -164,7 +318,44 @@ int Daemon::start(int argc, char* argv[],
                   bool verbose)
 {
     const auto& modulesDirs      = cfg.modulesDirs;
-    const auto& persistencePath  = cfg.persistencePath;
+
+    // Apply the session-directory redirects before anything asks Config for a
+    // path. Defaults keep every directory inside the config dir, which is what
+    // makes a session portable; an override is an explicit decision to move
+    // one out (a shared keyring, a cache on a bigger disk, a modules tree
+    // something else manages).
+    // Everything gated on this is a logosctl feature; logoscore keeps the
+    // behaviour it has today.
+    const bool modern = (Config::flavor() == Config::Flavor::Modern);
+
+    Config::setSessionDirOverride(Config::SessionDir::Modules, cfg.dirs.modules);
+    Config::setSessionDirOverride(Config::SessionDir::Plugins, cfg.dirs.plugins);
+    Config::setSessionDirOverride(Config::SessionDir::Keyring, cfg.dirs.keyring);
+    Config::setSessionDirOverride(Config::SessionDir::Data,    cfg.dirs.data);
+    Config::setSessionDirOverride(Config::SessionDir::Cache,   cfg.dirs.cache);
+    Config::setSessionDirOverride(Config::SessionDir::Logs,    cfg.dirs.logs);
+
+    // Start capturing before anything else runs, so the log holds the whole
+    // boot -- including a failure during it, which is exactly when the log is
+    // worth having. Non-fatal: a daemon that cannot write a log file is still
+    // a working daemon.
+    if (modern) {
+        LogSink::Options lo;
+        lo.enabled   = cfg.logging.enabled;
+        lo.dir       = Config::logsDir();
+        lo.file      = cfg.logging.file;
+        lo.maxSizeMb = cfg.logging.maxSizeMb;
+        lo.maxFiles  = cfg.logging.maxFiles;
+        // Mirror whenever configured, pipe or terminal alike: a caller doing
+        // `daemon start > out.log` is watching that pipe. Detached, the
+        // original stdout is /dev/null, so this costs a discarded write.
+        lo.console   = cfg.logging.console;
+        if (cfg.logging.enabled && !LogSink::instance().start(lo)) {
+            fprintf(stderr, "Warning: could not open the log file under %s; "
+                            "continuing without file logging.\n",
+                    lo.dir.c_str());
+        }
+    }
     const auto& moduleTransports = cfg.modules;
     // 1. Generate instance ID BEFORE core init, so logos_host inherits it
     std::random_device rd;
@@ -180,7 +371,7 @@ int Daemon::start(int argc, char* argv[],
 
     int64_t pid = getpid();
 
-    setenv("LOGOS_INSTANCE_ID", instanceId.c_str(), 1);
+    logosctl::setEnvVar("LOGOS_INSTANCE_ID", instanceId.c_str());
 
     // Share the node with an OS group if the operator asked (--access-group).
     // Validate the group ONCE here, up front, so the socket policy and the
@@ -194,6 +385,22 @@ int Daemon::start(int argc, char* argv[],
     // requires. `effectiveAccessGroup` (empty when unset or invalid) is what
     // gets handed to writeLocalClientArtifacts below.
     std::string effectiveAccessGroup = cfg.accessGroup;
+#ifdef _WIN32
+    // Refused outright rather than degraded to owner-only. Every mechanism the
+    // feature is built from is POSIX: an OS group database (getgrnam_r), a gid
+    // on the socket (chown), and a 0660 mode that an AF_UNIX connect() checks.
+    // Windows has none of them — QLocalServer is a named pipe, whose access is
+    // a security descriptor set at creation, and there is no group to name.
+    // Accepting the flag and quietly not sharing would tell an operator their
+    // node is group-restricted when it is in fact only user-restricted.
+    if (!effectiveAccessGroup.empty()) {
+        fprintf(stderr,
+                "Error: --access-group is not supported on Windows. Sharing a "
+                "node with an OS group needs POSIX group ownership and socket "
+                "mode bits, which named pipes do not have.\n");
+        return 1;
+    }
+#else
     if (!effectiveAccessGroup.empty()) {
         gid_t gid = 0;
         if (!resolveOsGroupGid(effectiveAccessGroup, gid)) {
@@ -203,10 +410,11 @@ int Daemon::start(int argc, char* argv[],
                     effectiveAccessGroup.c_str());
             effectiveAccessGroup.clear();
         } else {
-            setenv("LOGOS_SOCKET_GROUP", effectiveAccessGroup.c_str(), 1);
-            setenv("LOGOS_SOCKET_MODE", "0660", 1);
+            logosctl::setEnvVar("LOGOS_SOCKET_GROUP", effectiveAccessGroup.c_str());
+            logosctl::setEnvVar("LOGOS_SOCKET_MODE", "0660");
         }
     }
+#endif
 
     // Refuse to start if a live daemon already owns this config-dir — two would
     // clobber the shared state.json and re-issue the auto-token. Checked before
@@ -215,9 +423,9 @@ int Daemon::start(int argc, char* argv[],
     {
         const DaemonRuntimeState existing = DaemonRuntimeStateFile::read();
         if (existing.fileOk && existing.pid > 0
-            && ::kill(static_cast<pid_t>(existing.pid), 0) == 0) {
+            && logosctl::processAlive(existing.pid)) {
             fprintf(stderr,
-                    "Error: a logoscore daemon is already running in this config dir "
+                    "Error: a logosctl daemon is already running in this config dir "
                     "(pid %lld, instance %s). Refusing to start a second one — use "
                     "--config-dir for a parallel instance.\n",
                     static_cast<long long>(existing.pid),
@@ -275,10 +483,34 @@ int Daemon::start(int argc, char* argv[],
             fprintf(stderr, "Added bundled modules directory: %s\n", bundledDir.c_str());
     }
 
+    // 3b. The session's own writable modules directory — where anything
+    //     installed into this session lands. Without it on the search path,
+    //     `install` would put a module on disk that the daemon could never
+    //     see, so install-then-load could not work at all. Created eagerly so
+    //     the package manager has somewhere to write on its very first
+    //     install rather than failing on a missing directory.
+    if (modern) {
+        std::error_code ec;
+        for (const std::string& dir : {Config::modulesDir(), Config::pluginsDir(),
+                                       Config::keyringDir(), Config::cacheDir()}) {
+            std::filesystem::create_directories(dir, ec);
+        }
+        logos_core_add_modules_dir(Config::modulesDir().c_str());
+        // The bundled package modules live in their own directory so that
+        // logoscore's module list is byte-identical to what it reports today.
+        const std::string pkgDir = paths::bundledPackageModulesDir();
+        if (!pkgDir.empty())
+            logos_core_add_modules_dir(pkgDir.c_str());
+        if (verbose)
+            fprintf(stderr, "Added session modules directory: %s\n",
+                    Config::modulesDir().c_str());
+    }
+
     // 4. Set persistence base path for module instance data
-    std::string persistenceBase = persistencePath.empty()
-        ? Config::configDir() + "/data"
-        : persistencePath;
+    // Config::dataDir() already reflects dirs.data, and the loader folds the
+    // older persistence_path spelling into it, so there is nothing to choose
+    // between here.
+    std::string persistenceBase = Config::dataDir();
     logos_core_set_persistence_base_path(persistenceBase.c_str());
 
     // 4b. Install the access policy before any module loads. Empty =>
@@ -336,6 +568,21 @@ int Daemon::start(int argc, char* argv[],
     //    registered.
     logos_core_start();
 
+    // -v has to reach spdlog, not just Qt -- and it has to be set HERE.
+    //
+    // Module subprocesses do not share our stdio. The container gives each one
+    // its own pipes, reads them line by line, and re-emits each line through
+    // spdlog, picking the level from the line's prefix ("Debug:" -> debug).
+    // spdlog's default is `info`, so a module's debug output was read, parsed,
+    // classified -- and dropped at the last step. `-v` only ever gated OUR Qt
+    // handler, so no flag made those lines appear.
+    //
+    // Ordering matters and cost a wrong fix: setting the level before
+    // logos_core_start() is silently undone, because liblogos installs its own
+    // `logos` logger during startup and that becomes the default. Set it after
+    // and it sticks.
+    spdlog::set_level(verbose ? spdlog::level::debug : spdlog::level::info);
+
     // 7. Register core_service as an in-process module via the C++ SDK.
     //    core_service can publish on multiple transports simultaneously:
     //    a local QLocalSocket (back-compat) + any TCP / TCP+SSL listeners
@@ -346,7 +593,7 @@ int Daemon::start(int argc, char* argv[],
     coreServiceImpl->init(coreServiceApi);
     auto* provider = coreServiceApi->getProvider();
 
-    // Make operator-issued tokens (`logoscore issue-token --name alice`) actually
+    // Make operator-issued tokens (`logosctl token issue --name alice`) actually
     // authorize core_service calls. The built-in ModuleProxy scan only knows the
     // boot `auto` token and capability-minted tokens; this validator adds the
     // persisted token store, so a named token in daemon/tokens.json is accepted —
@@ -392,6 +639,30 @@ int Daemon::start(int argc, char* argv[],
 
     TokenManager::instance().saveToken("cli_client", autoTokenRaw);
 
+    // 8b. Bring up the bundled package modules and point them at this
+    //     session's directories.
+    //
+    //     These are loaded unconditionally, like basecamp does after
+    //     logos_core_start (app/main.cpp), because every package command is
+    //     an RPC into them — a client that had to load them first would pay
+    //     the cost on its first `package` command and race any concurrent
+    //     client doing the same.
+    //
+    //     The directory configuration is the same four calls basecamp makes
+    //     (PackageCoordinator::subscribeToPackageInstallationEvents): embedded
+    //     is the read-only tree beside the binary, user is the session's
+    //     writable tree. Without it the manager has no writable target and
+    //     scans nothing, so `package ls` would report an empty session even
+    //     after a successful install.
+    //
+    //     Failures here are logged, not fatal: a daemon that cannot manage
+    //     packages is still a perfectly good daemon for loading and calling
+    //     modules, and refusing to boot would turn a missing optional module
+    //     into total unavailability.
+    if (modern)
+        bootstrapPackageModules(coreServiceApi, paths::bundledPackageModulesDir(),
+                                cfg.signaturePolicy, verbose);
+
     // 9. Write the live-instance state file. Carries the resolved
     //    transport endpoints (post-bind, with real ports), instanceId/
     //    pid/startedAt for co-resident clients, and a snapshot of the
@@ -419,11 +690,9 @@ int Daemon::start(int argc, char* argv[],
         return 1;
     }
 
-    // Persist operator preferences only if asked. Done after state.json
-    // is on disk so a config that fails earlier (e.g. bind failure)
-    // doesn't pollute config.json. The persisted file holds intent
-    // (port=0 stays 0) — the resolved values are in state.json.
-    // Persistence failures are non-fatal: log and continue.
+    // Persist operator preferences only if asked (legacy front-end only).
+    // Done after state.json is on disk so a config that fails earlier (e.g. a
+    // bind failure) doesn't pollute config.json.
     if (persistConfig) {
         if (DaemonConfigFile::write(cfg)) {
             fprintf(stdout, "Persisted config: %s\n",
@@ -456,7 +725,7 @@ int Daemon::start(int argc, char* argv[],
                 Config::clientDir().c_str());
     }
 
-    fprintf(stdout, "Logoscore daemon started (pid %lld, instance %s)\n",
+    fprintf(stdout, "Logosctl daemon started (pid %lld, instance %s)\n",
             static_cast<long long>(pid), instanceId.c_str());
     fprintf(stdout, "Daemon state: %s\n", DaemonRuntimeStateFile::filePath().c_str());
     fprintf(stdout, "Local client config: %s\n",
@@ -479,16 +748,17 @@ int Daemon::start(int argc, char* argv[],
     int result = QCoreApplication::exec();
 
     // 10. Cleanup
-    fprintf(stdout, "Shutting down logoscore daemon...\n");
+    fprintf(stdout, "Shutting down logosctl daemon...\n");
     fflush(stdout);
 
     logos_core_cleanup();
+    LogSink::instance().stop();
     DaemonRuntimeStateFile::remove();
 
     delete coreServiceImpl;
     delete coreServiceApi;
 
-    fprintf(stdout, "Logoscore daemon stopped.\n");
+    fprintf(stdout, "Logosctl daemon stopped.\n");
     fflush(stdout);
 
     return result;

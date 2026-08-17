@@ -3,9 +3,12 @@
 # Testable library: config, daemon_state, output, commands (with mock client)
 set(TEST_LIB_SOURCES
     ${CMAKE_SOURCE_DIR}/src/config.cpp
+    ${CMAKE_SOURCE_DIR}/src/paths.cpp
+    ${CMAKE_SOURCE_DIR}/src/yaml_json.cpp
     ${CMAKE_SOURCE_DIR}/src/daemon/daemon_state.cpp
     ${CMAKE_SOURCE_DIR}/src/daemon/port_allocator.cpp
     ${CMAKE_SOURCE_DIR}/src/daemon/token_store.cpp
+    ${CMAKE_SOURCE_DIR}/src/daemon/log_sink.cpp
     ${CMAKE_SOURCE_DIR}/src/client/client_state.cpp
     ${CMAKE_SOURCE_DIR}/src/client/output.cpp
     ${CMAKE_SOURCE_DIR}/src/client/commands/command.cpp
@@ -22,26 +25,33 @@ set(TEST_LIB_SOURCES
     ${CMAKE_SOURCE_DIR}/src/client/commands/issue_token_command.cpp
     ${CMAKE_SOURCE_DIR}/src/client/commands/revoke_token_command.cpp
     ${CMAKE_SOURCE_DIR}/src/client/commands/list_tokens_command.cpp
+    ${CMAKE_SOURCE_DIR}/src/client/commands/package_command.cpp
+    ${CMAKE_SOURCE_DIR}/src/client/commands/catalog_command.cpp
+    ${CMAKE_SOURCE_DIR}/src/client/commands/config_command.cpp
 )
 
-add_library(logoscore_testlib STATIC ${TEST_LIB_SOURCES})
-target_include_directories(logoscore_testlib PUBLIC
+add_library(logosctl_testlib STATIC ${TEST_LIB_SOURCES})
+target_include_directories(logosctl_testlib PUBLIC
     ${CMAKE_SOURCE_DIR}/src
     ${LOGOS_LIBLOGOS_ROOT}/include
 )
-target_link_libraries(logoscore_testlib PUBLIC
+target_link_libraries(logosctl_testlib PUBLIC
     CLI11::CLI11
     Qt${QT_VERSION_MAJOR}::Core
     Qt${QT_VERSION_MAJOR}::RemoteObjects
     nlohmann_json::nlohmann_json
     OpenSSL::Crypto
     fmt::fmt
+    yaml-cpp::yaml-cpp
+    spdlog::spdlog
 )
 
 # Unit tests
 add_executable(unit_tests
     test_config.cpp
+    test_log_sink.cpp
     test_daemon_state.cpp
+    test_paths.cpp
     test_output.cpp
     test_commands.cpp
     test_mode_detection.cpp
@@ -54,14 +64,14 @@ target_include_directories(unit_tests PRIVATE
 )
 
 target_link_libraries(unit_tests PRIVATE
-    logoscore_testlib
+    logosctl_testlib
     GTest::gtest_main
     Qt${QT_VERSION_MAJOR}::Core
 )
 
 gtest_discover_tests(unit_tests)
 
-# ── CLI integration tests (require compiled logoscore binary) ─────────────────
+# ── CLI integration tests (require compiled logosctl binary) ─────────────────
 
 add_executable(cli_tests
     test_cli.cpp
@@ -77,6 +87,23 @@ target_include_directories(cli_tests PRIVATE
 )
 
 gtest_discover_tests(cli_tests)
+
+# The same suite against logoscore. Both binaries ship, so both are tested;
+# this target goes away with the tool.
+add_executable(cli_tests_logoscore
+    test_cli_logoscore.cpp
+)
+
+target_link_libraries(cli_tests_logoscore PRIVATE
+    GTest::gtest_main
+    Qt${QT_VERSION_MAJOR}::Core
+)
+
+target_include_directories(cli_tests_logoscore PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+)
+
+gtest_discover_tests(cli_tests_logoscore)
 
 # ── Daemon-backed integration tests (own target, own CTest entry) ────────────
 #
@@ -97,6 +124,20 @@ target_link_libraries(integration_tests PRIVATE
 )
 
 target_include_directories(integration_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+)
+
+# Same again for logoscore. Deleted with the tool.
+add_executable(integration_tests_logoscore
+    test_integration_logoscore.cpp
+)
+
+target_link_libraries(integration_tests_logoscore PRIVATE
+    GTest::gtest_main
+    Qt${QT_VERSION_MAJOR}::Core
+)
+
+target_include_directories(integration_tests_logoscore PRIVATE
     ${CMAKE_SOURCE_DIR}/src
 )
 

@@ -1,7 +1,8 @@
-name: logoscore Doc-Tests
+name: Doc-Tests
 
-# Runs the executable logoscore doc-tests (everything under doctests/*.test.yaml)
-# end-to-end via the shared doctest CLI: builds logoscore from the published
+# Runs every executable doc-test under doctests/*.test.yaml end-to-end via the
+# shared doctest CLI -- both the logoscore specs and the logosctl ones, since
+# this repo ships both binaries. Builds them from the published
 # flake, starts the daemon, loads a module, calls methods, exercises the TCP /
 # TCP+TLS transports, and asserts on output. Every spec is run back-to-back into
 # a single HTML report (each spec is its own dropdown entry).
@@ -36,7 +37,7 @@ concurrency:
 
 jobs:
   doctests:
-    name: logoscore doc-tests (${{ matrix.os }})
+    name: doc-tests (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -88,7 +89,7 @@ jobs:
       # commit under test, so `github:logos-co/logos-logoscore-cli{release}` in
       # the spec becomes `.../<sha>` — the doc-test exercises this PR/push rather
       # than master. Every other repo URL still resolves to latest.
-      - name: Run logoscore doc-tests
+      - name: Run doc-tests
         shell: bash
         run: |
           # Run every doctests/*.test.yaml back-to-back into one report; each
@@ -106,7 +107,7 @@ jobs:
             --verbose \
             --continue-on-fail \
             --release-for logos-logoscore-cli=${{ steps.commit.outputs.sha }} \
-            --report "${{ runner.temp }}/logoscore-doctest-report.html"
+            --report "${{ runner.temp }}/doctest-report.html"
 
       - name: Stage report for upload
         if: always()
@@ -114,17 +115,17 @@ jobs:
         run: |
           mkdir -p report-out
           # Name it index.html so the published directory URL renders directly.
-          if [ -f "${{ runner.temp }}/logoscore-doctest-report.html" ]; then
-            cp "${{ runner.temp }}/logoscore-doctest-report.html" report-out/index.html
+          if [ -f "${{ runner.temp }}/doctest-report.html" ]; then
+            cp "${{ runner.temp }}/doctest-report.html" report-out/index.html
           else
             echo "<h1>No report produced</h1>" > report-out/index.html
           fi
 
-      - name: Upload logoscore execution report
+      - name: Upload logosctl execution report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: logoscore-doctest-report-${{ matrix.os }}
+          name: doctest-report-${{ matrix.os }}
           path: report-out/index.html
           if-no-files-found: warn
 
@@ -181,7 +182,7 @@ jobs:
           mkdir -p "site/$BASE"
           found=""
           for os in ubuntu-latest macos-latest; do
-            src="artifacts/logoscore-doctest-report-$os/index.html"
+            src="artifacts/doctest-report-$os/index.html"
             if [ -f "$src" ]; then
               mkdir -p "site/$BASE/$os"
               cp "$src" "site/$BASE/$os/index.html"
@@ -193,9 +194,9 @@ jobs:
           # Landing page for this ref linking to each OS report.
           {
             echo "<!doctype html><meta charset=utf-8>"
-            echo "<title>logoscore doc-test reports — $BASE</title>"
+            echo "<title>logosctl doc-test reports — $BASE</title>"
             echo "<style>body{font:16px system-ui;margin:40px;max-width:640px}a{color:#2563eb}</style>"
-            echo "<h1>logoscore doc-test reports</h1>"
+            echo "<h1>logosctl doc-test reports</h1>"
             echo "<p><strong>$BASE</strong> · commit <code>${GITHUB_SHA::7}</code></p><ul>"
             for os in ubuntu-latest macos-latest; do
               if [ -d "site/$BASE/$os" ]; then
@@ -212,7 +213,7 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./site
           keep_files: true          # don't wipe other PRs' directories
-          commit_message: "Publish logoscore doc-test report for ${{ steps.arrange.outputs.base }} (${{ github.sha }})"
+          commit_message: "Publish logosctl doc-test report for ${{ steps.arrange.outputs.base }} (${{ github.sha }})"
 
       - name: Comment on PR with report links
         if: ${{ github.event_name == 'pull_request' && steps.arrange.outputs.found != '' }}
@@ -226,10 +227,10 @@ jobs:
             const oses = "${{ steps.arrange.outputs.found }}".trim().split(/\s+/).filter(Boolean);
 
             const links = oses.map(os => `- [\`${os}\` report](${root}/${os}/)`).join("\n");
-            const marker = "<!-- logoscore-doctest-report-links -->";
+            const marker = "<!-- doctest-report-links -->";
             const body =
               `${marker}\n` +
-              `### 📊 logoscore doc-test report\n\n` +
+              `### 📊 logosctl doc-test report\n\n` +
               `Rendered documentation alongside the commands actually run and their output ` +
               `(updated each run, commit \`${context.sha.slice(0,7)}\`):\n\n` +
               `${links}\n\n` +

@@ -1,4 +1,6 @@
 #include <gtest/gtest.h>
+
+#include <filesystem>
 #include <logos_json.h>
 #include <algorithm>
 #include <cstdint>
@@ -22,7 +24,7 @@ class MockClient : public Client {
 public:
     // Control mock behavior
     bool shouldConnect = true;
-    std::string connectError = "No running logoscore daemon. Start one with: logoscore -D";
+    std::string connectError = "No running logosctl daemon. Start one with: logosctl -D";
     LogosMap  loadModuleResult;
     LogosMap  unloadModuleResult;
     LogosMap  reloadModuleResult;
@@ -32,11 +34,25 @@ public:
     LogosList moduleStatsResult;
     LogosMap  callMethodResult;
     LogosMap  shutdownResult;
+    LogosMap  refreshModulesResult;
+    LogosMap  planPackageResult;
+    LogosMap  applyPackageResult;
+    LogosMap  downloadResult;
 
     // Track calls
     bool shutdownCalled = false;
+    bool refreshModulesCalled = false;
+    bool applyPackageCalled = false;
+    std::string lastPackageOp;
+    LogosList   lastPackageNames;
+    LogosMap    lastPackageOpts;
+    std::string lastDownloadName;
+    LogosMap    lastDownloadOpts;
     std::string lastLoadedModule;
     std::string lastUnloadedModule;
+    // Defaults to true so a test that never sets --no-dependents still sees
+    // the production default rather than a value-initialised false.
+    bool lastUnloadWithDependents = true;
     std::string lastReloadedModule;
     std::string lastInfoModule;
     std::string lastCallModule;
@@ -61,9 +77,38 @@ public:
         return loadModuleResult;
     }
 
-    LogosMap unloadModule(const std::string& name) override {
+    LogosMap unloadModule(const std::string& name, bool withDependents) override {
         lastUnloadedModule = name;
+        lastUnloadWithDependents = withDependents;
         return unloadModuleResult;
+    }
+
+    LogosMap refreshModules() override {
+        refreshModulesCalled = true;
+        return refreshModulesResult;
+    }
+
+    LogosMap planPackageOperation(const std::string& op, const LogosList& names,
+                                  const LogosMap& opts) override {
+        lastPackageOp = op;
+        lastPackageNames = names;
+        lastPackageOpts = opts;
+        return planPackageResult;
+    }
+
+    LogosMap applyPackageOperation(const std::string& op, const LogosList& names,
+                                   const LogosMap& opts) override {
+        lastPackageOp = op;
+        lastPackageNames = names;
+        lastPackageOpts = opts;
+        applyPackageCalled = true;
+        return applyPackageResult;
+    }
+
+    LogosMap downloadPackage(const std::string& name, const LogosMap& opts) override {
+        lastDownloadName = name;
+        lastDownloadOpts = opts;
+        return downloadResult;
     }
 
     LogosMap reloadModule(const std::string& name) override {
@@ -297,6 +342,57 @@ TEST_F(CommandTest, UnloadModule_Success)
     });
 
     EXPECT_EQ(mockClient.lastUnloadedModule, "waku");
+}
+
+// The cascade is the default — a bare `unload-module X` must take X's
+// dependents down with it, since leaving them bound to an unloaded provider
+// is the more surprising outcome.
+TEST_F(CommandTest, UnloadModule_CascadesToDependentsByDefault)
+{
+    mockClient.unloadModuleResult = LogosMap{
+        {"status", "ok"}, {"module", "waku"}
+    };
+    mockClient.lastUnloadWithDependents = false;  // prove the command sets it
+
+    auto cmd = createCommand("unload-module", mockClient, output);
+    captureOutput([&]() {
+        EXPECT_EQ(cmd->execute({"waku"}), 0);
+    });
+
+    EXPECT_TRUE(mockClient.lastUnloadWithDependents);
+}
+
+TEST_F(CommandTest, UnloadModule_NoDependentsOptsOutOfCascade)
+{
+    mockClient.unloadModuleResult = LogosMap{
+        {"status", "ok"}, {"module", "waku"}
+    };
+
+    auto cmd = createCommand("unload-module", mockClient, output);
+    captureOutput([&]() {
+        EXPECT_EQ(cmd->execute({"waku", "--no-dependents"}), 0);
+    });
+
+    EXPECT_EQ(mockClient.lastUnloadedModule, "waku");
+    EXPECT_FALSE(mockClient.lastUnloadWithDependents);
+}
+
+// A cascade that quietly stops three other modules has to be reported.
+TEST_F(CommandTest, UnloadModule_Human_ReportsUnloadedDependents)
+{
+    mockClient.unloadModuleResult = LogosMap{
+        {"status", "ok"}, {"module", "waku"},
+        {"dependents_unloaded", LogosList{"chat", "delivery"}}
+    };
+
+    output.setHumanMode(true);
+    auto cmd = createCommand("unload-module", mockClient, output);
+    std::string out = captureOutput([&]() {
+        EXPECT_EQ(cmd->execute({"waku"}), 0);
+    });
+
+    EXPECT_NE(out.find("chat"), std::string::npos);
+    EXPECT_NE(out.find("delivery"), std::string::npos);
 }
 
 // ── reload-module ────────────────────────────────────────────────────────────
@@ -780,7 +876,7 @@ TEST_F(CommandTest, Call_JsonPrefixParsesNestedAndScalars)
 
 TEST_F(CommandTest, Call_JsonPrefixFromFile)
 {
-    const std::string path = testing::TempDir() + "logoscore_call_json_arg.json";
+    const std::string path = testing::TempDir() + "logosctl_call_json_arg.json";
     { std::ofstream f(path); f << "[10, 20, 30]"; }
     mockClient.callMethodResult = LogosMap{{"status", "ok"}};
     auto cmd = createCommand("call", mockClient, output);
@@ -810,7 +906,7 @@ TEST_F(CommandTest, Call_JsonPrefixMissingFileErrors)
     auto cmd = createCommand("call", mockClient, output);
     int exitCode = 0;
     captureOutput([&]() {
-        exitCode = cmd->execute({"m", "f", "json:@/no/such/logoscore/file.json"});
+        exitCode = cmd->execute({"m", "f", "json:@/no/such/logosctl/file.json"});
     });
     EXPECT_EQ(exitCode, 1);
     EXPECT_NE(mockClient.lastCallMethod, "f");
@@ -853,7 +949,7 @@ TEST_F(CommandTest, Call_EmptyFileYieldsEmptyStringNotError)
     // A readable-but-empty @file is a successful read of "", distinct from an
     // unreadable file (which errors). Regression guard for resolveFileParam's
     // couldn't-open vs read-but-empty distinction.
-    const std::string path = testing::TempDir() + "logoscore_call_empty_arg";
+    const std::string path = testing::TempDir() + "logosctl_call_empty_arg";
     { std::ofstream f(path); }  // create empty
     mockClient.callMethodResult = LogosMap{{"status", "ok"}};
     auto cmd = createCommand("call", mockClient, output);
@@ -873,7 +969,7 @@ TEST_F(CommandTest, Call_MissingFileErrors)
     auto cmd = createCommand("call", mockClient, output);
     int exitCode = 0;
     captureOutput([&]() {
-        exitCode = cmd->execute({"m", "f", "@/no/such/logoscore/file.txt"});
+        exitCode = cmd->execute({"m", "f", "@/no/such/logosctl/file.txt"});
     });
     EXPECT_EQ(exitCode, 1);
     EXPECT_NE(mockClient.lastCallMethod, "f");
@@ -1038,4 +1134,148 @@ TEST_F(CommandTest, Stop_NoDaemon)
 
     nlohmann::json doc = parseJson(out);
     EXPECT_EQ(doc["code"].get<std::string>(), "NO_DAEMON");
+}
+
+// ---------------------------------------------------------------------------
+// package download
+//
+// These exist because `-o` was parsed and then thrown away — the option was
+// accepted, the file went to $TMPDIR, and nothing anywhere said so. There was
+// no unit coverage of PackageCommand at all, which is why it survived.
+// ---------------------------------------------------------------------------
+
+TEST_F(CommandTest, PackageDownload_PassesOutputDirectoryThrough)
+{
+    mockClient.downloadResult = LogosMap{
+        {"status", "ok"},
+        {"result", LogosMap{{"name", "storage_module"}, {"path", "/out/storage_module.lgx"}}}};
+
+    auto cmd = createCommand("package", mockClient, output);
+    captureOutput([&]() {
+        int exitCode = cmd->execute({"download", "storage_module", "-o", "/out"});
+        EXPECT_EQ(exitCode, 0);
+    });
+
+    EXPECT_EQ(mockClient.lastDownloadName, "storage_module");
+    EXPECT_EQ(mockClient.lastDownloadOpts.value("output", std::string{}), "/out");
+}
+
+// A relative -o has to become absolute before it leaves this process: the
+// daemon does the move, and its working directory is not ours -- for a
+// detached daemon it is wherever it happened to be started.
+TEST_F(CommandTest, PackageDownload_ResolvesRelativeOutputAgainstOurCwd)
+{
+    mockClient.downloadResult = LogosMap{
+        {"status", "ok"}, {"result", LogosMap{{"path", "/x/p.lgx"}}}};
+
+    auto cmd = createCommand("package", mockClient, output);
+    captureOutput([&]() { cmd->execute({"download", "pkg", "-o", "pkgs"}); });
+
+    const std::string sent = mockClient.lastDownloadOpts.value("output", std::string{});
+    ASSERT_FALSE(sent.empty());
+    EXPECT_EQ(sent, (std::filesystem::current_path() / "pkgs").string())
+        << "a relative -o must be resolved against the client's cwd, not sent raw";
+}
+
+// No -o means "the session's cache", which only the daemon knows the path of.
+// Sending an empty string is how it is told to use that default.
+TEST_F(CommandTest, PackageDownload_NoOutputDirLeavesTheChoiceToTheDaemon)
+{
+    mockClient.downloadResult = LogosMap{
+        {"status", "ok"}, {"result", LogosMap{{"path", "/cache/downloads/p.lgx"}}}};
+
+    auto cmd = createCommand("package", mockClient, output);
+    captureOutput([&]() { cmd->execute({"download", "pkg"}); });
+
+    EXPECT_EQ(mockClient.lastDownloadOpts.value("output", std::string("unset")), "");
+}
+
+TEST_F(CommandTest, PackageDownload_ReportsFailure)
+{
+    mockClient.downloadResult = LogosMap{
+        {"status", "error"}, {"code", "DOWNLOAD_FAILED"}, {"message", "no such package"}};
+
+    auto cmd = createCommand("package", mockClient, output);
+    std::string out = captureOutput([&]() {
+        int exitCode = cmd->execute({"download", "nope"});
+        EXPECT_EQ(exitCode, 1);
+    });
+
+    nlohmann::json doc = parseJson(out);
+    EXPECT_EQ(doc["code"].get<std::string>(), "DOWNLOAD_FAILED");
+}
+
+// ── package failure reporting ───────────────────────────────────────────────
+//
+// A real install failure was reported as "install failed at step '?': " with
+// nothing after the colon. The daemon had said why; the client dropped it,
+// because package_ops returns two different error shapes and this only read
+// one. The reason is the entire value of the message.
+
+TEST_F(CommandTest, PackageMutate_ReportsTheReasonFromEitherErrorShape)
+{
+    mockClient.planPackageResult = LogosMap{
+        {"status", "ok"},
+        {"changes", LogosList::array({LogosMap{{"name","blockchain_module"},
+                                               {"action","install"},
+                                               {"toVersion","0.2.1"}}})},
+        {"affected_loaded", LogosList::array()}};
+
+    // The shape produced before the step chain starts: code + message.
+    mockClient.applyPackageResult = LogosMap{
+        {"status", "error"},
+        {"code", "DOWNLOAD_FAILED"},
+        {"message", "package_downloader did not respond"}};
+
+    auto cmd = createCommand("package", mockClient, output);
+    std::string out = captureOutput([&]() {
+        int exitCode = cmd->execute({"install", "blockchain_module", "-y"});
+        EXPECT_EQ(exitCode, 1);
+    });
+
+    nlohmann::json doc = parseJson(out);
+    const std::string msg = doc["message"].get<std::string>();
+    EXPECT_NE(msg.find("package_downloader did not respond"), std::string::npos)
+        << "the daemon's reason must survive to the user; got: " << msg;
+    EXPECT_EQ(msg.find("step '?'"), std::string::npos)
+        << "an unknown step should be omitted, not printed as '?': " << msg;
+}
+
+TEST_F(CommandTest, PackageMutate_KeepsTheStepWhenTheDaemonReportsOne)
+{
+    mockClient.planPackageResult = LogosMap{
+        {"status", "ok"},
+        {"changes", LogosList::array({LogosMap{{"name","storage_module"},
+                                               {"action","install"}}})},
+        {"affected_loaded", LogosList::array()}};
+
+    // The shape package_ops' own `fail()` produces: failed_step + error.
+    mockClient.applyPackageResult = LogosMap{
+        {"status", "error"},
+        {"failed_step", "confirm"},
+        {"error", "package_manager rejected the install"}};
+
+    auto cmd = createCommand("package", mockClient, output);
+    std::string out = captureOutput([&]() { cmd->execute({"install", "storage_module", "-y"}); });
+
+    const std::string msg = parseJson(out)["message"].get<std::string>();
+    EXPECT_NE(msg.find("confirm"), std::string::npos) << msg;
+    EXPECT_NE(msg.find("package_manager rejected the install"), std::string::npos) << msg;
+}
+
+// Never print a bare colon with nothing after it: if both shapes are empty we
+// still owe the reader a sentence.
+TEST_F(CommandTest, PackageMutate_SaysSoWhenNoReasonWasReported)
+{
+    mockClient.planPackageResult = LogosMap{
+        {"status", "ok"},
+        {"changes", LogosList::array({LogosMap{{"name","x"},{"action","install"}}})},
+        {"affected_loaded", LogosList::array()}};
+    mockClient.applyPackageResult = LogosMap{{"status", "error"}};
+
+    auto cmd = createCommand("package", mockClient, output);
+    std::string out = captureOutput([&]() { cmd->execute({"install", "x", "-y"}); });
+
+    const std::string msg = parseJson(out)["message"].get<std::string>();
+    EXPECT_NE(msg.find("no reason reported"), std::string::npos) << msg;
 }
