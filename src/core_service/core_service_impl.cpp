@@ -4,7 +4,6 @@
 #include "logos_core.h"
 #include <logos_api.h>
 #include <logos_api_client.h>
-#include <logos_mode.h>
 
 #include <QCoreApplication>
 #include <algorithm>
